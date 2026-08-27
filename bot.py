@@ -15,17 +15,19 @@ import time
 import uuid
 from pathlib import Path
 
-from telegram import BotCommand, Update
+from telegram import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ChatAction, ParseMode
 from telegram.error import BadRequest, TelegramError
 from telegram.ext import (
     Application,
+    CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
     MessageHandler,
     filters,
 )
 
+import bridge
 import claude_runner
 import config
 import store
@@ -44,6 +46,12 @@ _sessions: dict[str, store.Session] = {}
 _jobs: dict[str, asyncio.Task] = {}
 _media_groups: dict[str, dict] = {}
 _media_lock = asyncio.Lock()
+
+# Approval/question plumbing (see bridge.py).
+_run_settings = ""
+_run_mcp = ""
+_seen_requests: dict[str, float] = {}
+_awaiting_text: dict[str, str] = {}  # session key -> request id awaiting a typed answer
 
 
 # ── access control ────────────────────────────────────────────────────────
@@ -200,6 +208,9 @@ async def run_job(update: Update, context: ContextTypes.DEFAULT_TYPE, prompt: st
     placeholder = await message.reply_text(f"{header}\n<i>thinking…</i>", parse_mode=ParseMode.HTML)
     progress = Progress(placeholder, header)
 
+    run_id = uuid.uuid4().hex[:12]
+    thread_id = getattr(message, "message_thread_id", None)
+
     spec = RunSpec(
         prompt=prompt,
         cwd=session.cwd,
@@ -208,12 +219,20 @@ async def run_job(update: Update, context: ContextTypes.DEFAULT_TYPE, prompt: st
         add_dirs=add_dirs,
         model=session.model,
         effort=config.CLAUDE_EFFORT,
-        permission_mode=config.PERMISSION_MODE,
-        allowed_tools=config.ALLOWED_TOOLS,
+        permission_mode=config.effective_permission_mode(),
+        allowed_tools=config.effective_allowed_tools(),
         disallowed_tools=config.DISALLOWED_TOOLS,
         append_system_prompt=config.APPEND_SYSTEM_PROMPT,
         max_budget_usd=config.MAX_BUDGET_USD,
         timeout_seconds=config.RUN_TIMEOUT_SECONDS,
+        settings_path=_run_settings,
+        mcp_config_path=_run_mcp,
+        env_extra={
+            "CCTG_RUN_ID": run_id,
+            "CCTG_CHAT_ID": str(message.chat_id),
+            "CCTG_THREAD_ID": str(thread_id or ""),
+            "CCTG_SESSION_KEY": key,
+        },
     )
 
     async def worker() -> None:
@@ -287,6 +306,9 @@ async def run_job(update: Update, context: ContextTypes.DEFAULT_TYPE, prompt: st
     finally:
         if _jobs.get(key) is task:
             _jobs.pop(key, None)
+        # Standing "allow all Bash" approvals last for one run only.
+        bridge.clear_rules(run_id)
+        _awaiting_text.pop(key, None)
 
 
 # ── attachment handling ───────────────────────────────────────────────────
@@ -341,6 +363,185 @@ async def flush_media_group(
     if not group or not group["paths"]:
         return
     await run_job(update, context, build_attachment_prompt(group["paths"], group["caption"]))
+
+
+# ── approvals and questions ───────────────────────────────────────────────
+
+_ask_options: dict[str, list[str]] = {}
+
+
+def _render_permission(request: dict) -> str:
+    tool = str(request.get("tool_name") or "tool")
+    summary = request.get("summary") or {}
+    lines = [f"🔐 <b>Approval needed</b> — <b>{html.escape(tool)}</b>"]
+
+    if tool == "Bash":
+        note = summary.get("note") or ""
+        if note:
+            lines.append(html.escape(tg_format.truncate(note, 160)))
+        lines.append(f"<pre>{html.escape(str(summary.get('command') or '')[:1200])}</pre>")
+    elif tool in {"Edit", "Write", "NotebookEdit"}:
+        target = str(summary.get("file") or "")
+        scope = " (all occurrences)" if summary.get("replace_all") else ""
+        lines.append(f"<code>{html.escape(target)}</code>{scope}")
+        preview = str(summary.get("preview") or "")
+        if preview:
+            lines.append(f"<pre>{html.escape(preview[:700])}</pre>")
+    else:
+        for key, value in list(summary.items())[:4]:
+            lines.append(
+                f"<b>{html.escape(str(key))}</b> "
+                f"<code>{html.escape(tg_format.truncate(str(value), 200))}</code>"
+            )
+
+    return "\n".join(lines)
+
+
+def _permission_keyboard(request_id: str, tool: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("✅ Allow", callback_data=f"p:{request_id}:a"),
+                InlineKeyboardButton("⛔ Deny", callback_data=f"p:{request_id}:d"),
+            ],
+            [
+                InlineKeyboardButton(
+                    f"✅ Allow every {tool} in this run", callback_data=f"p:{request_id}:A"
+                )
+            ],
+        ]
+    )
+
+
+async def _present_request(app: Application, request: dict) -> None:
+    """Turn one queued request into a Telegram message (with buttons, if it needs an answer)."""
+    request_id = str(request.get("id") or "")
+    kind = str(request.get("kind") or "")
+    try:
+        chat_id = int(request.get("chat_id") or 0)
+    except ValueError:
+        chat_id = 0
+    if not request_id or not chat_id:
+        return
+
+    send_kwargs: dict = {"chat_id": chat_id, "parse_mode": ParseMode.HTML}
+    thread_id = str(request.get("thread_id") or "")
+    if thread_id.isdigit():
+        send_kwargs["message_thread_id"] = int(thread_id)
+
+    try:
+        if kind == "notify":
+            text = tg_format.truncate(str(request.get("text") or ""), 900)
+            await app.bot.send_message(text=f"📣 {html.escape(text)}", **send_kwargs)
+            bridge.discard(request_id)
+            return
+
+        if kind == "permission":
+            tool = str(request.get("tool_name") or "tool")
+            await app.bot.send_message(
+                text=_render_permission(request),
+                reply_markup=_permission_keyboard(request_id, tool),
+                **send_kwargs,
+            )
+            return
+
+        if kind == "ask":
+            question = html.escape(str(request.get("question") or ""))
+            options = [str(option) for option in (request.get("options") or [])]
+            if options:
+                _ask_options[request_id] = options
+                keyboard = InlineKeyboardMarkup(
+                    [
+                        [
+                            InlineKeyboardButton(
+                                tg_format.truncate(option, 60), callback_data=f"c:{request_id}:{i}"
+                            )
+                        ]
+                        for i, option in enumerate(options)
+                    ]
+                )
+                await app.bot.send_message(
+                    text=f"❓ {question}", reply_markup=keyboard, **send_kwargs
+                )
+            else:
+                session_key_value = str(request.get("session_key") or f"{chat_id}:0")
+                _awaiting_text[session_key_value] = request_id
+                await app.bot.send_message(
+                    text=f"❓ {question}\n\n<i>Reply with your answer.</i>", **send_kwargs
+                )
+            return
+
+    except TelegramError as exc:
+        # Never leave the hook blocked on a message that failed to send.
+        log.error("could not present %s request: %s", kind, exc)
+        bridge.respond(request_id, {"choice": "deny", "note": f"Could not reach Telegram: {exc}"})
+
+
+async def approval_watcher(app: Application) -> None:
+    """Poll the disk queue. Human-speed decisions do not need anything faster."""
+    bridge.prune_stale()
+    while True:
+        try:
+            now = time.time()
+            for request_id, seen_at in list(_seen_requests.items()):
+                if now - seen_at > 3600:
+                    _seen_requests.pop(request_id, None)
+                    _ask_options.pop(request_id, None)
+
+            for request in bridge.pending():
+                request_id = str(request.get("id") or "")
+                if not request_id or request_id in _seen_requests:
+                    continue
+                _seen_requests[request_id] = now
+                asyncio.create_task(_present_request(app, request))
+        except Exception:  # noqa: BLE001 - the watcher must outlive any single bad request
+            log.exception("approval watcher")
+        await asyncio.sleep(0.4)
+
+
+async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    if query is None:
+        return
+    if not is_authorized(update):
+        await query.answer("Not authorized.", show_alert=True)
+        return
+
+    parts = (query.data or "").split(":")
+    if len(parts) != 3:
+        await query.answer()
+        return
+    prefix, request_id, choice = parts
+
+    if prefix == "p":
+        decision = {"a": "allow", "A": "allow_always", "d": "deny"}.get(choice, "deny")
+        bridge.respond(request_id, {"choice": decision})
+        label = {
+            "allow": "✅ Allowed",
+            "allow_always": "✅ Allowed for the rest of this run",
+            "deny": "⛔ Denied",
+        }[decision]
+    elif prefix == "c":
+        options = _ask_options.pop(request_id, [])
+        try:
+            answer = options[int(choice)]
+        except (ValueError, IndexError):
+            await query.answer("That option expired.", show_alert=True)
+            return
+        bridge.respond(request_id, {"answer": answer})
+        label = f"✅ {tg_format.truncate(answer, 80)}"
+    else:
+        await query.answer()
+        return
+
+    await query.answer()
+    try:
+        original = query.message.text_html if query.message else ""
+        await query.edit_message_text(
+            f"{original}\n\n<b>{html.escape(label)}</b>", parse_mode=ParseMode.HTML
+        )
+    except TelegramError:
+        pass
 
 
 # ── handlers ──────────────────────────────────────────────────────────────
@@ -403,8 +604,13 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     session = get_session(key)
     task = _jobs.get(key)
     running = "yes" if task and not task.done() else "no"
+    if config.APPROVALS_ENABLED:
+        gate = f"ask me for {', '.join(config.ASK_TOOLS)}"
+    else:
+        gate = f"unattended ({config.PERMISSION_MODE})"
     await update.effective_message.reply_text(
         f"<b>Running</b> {running}\n"
+        f"<b>Approvals</b> {html.escape(gate)}\n"
         f"<b>Repo</b> <code>{html.escape(session.cwd)}</code>\n"
         f"<b>Model</b> {html.escape(session.model or 'default')}\n"
         f"<b>Turns</b> {session.turns} · <b>Spent</b> ${session.cost_usd:.3f}\n"
@@ -485,6 +691,14 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     message = update.effective_message
     text = (message.text or "").strip()
     if not text:
+        return
+
+    # A run is blocked on mcp__tg__ask_user: this message is the answer, not a
+    # new instruction.
+    pending_ask = _awaiting_text.pop(session_key(update), "")
+    if pending_ask:
+        bridge.respond(pending_ask, {"answer": text})
+        await message.reply_text("✅ Sent to Claude.")
         return
 
     store.append_inbox(
@@ -574,6 +788,7 @@ async def post_init(app: Application) -> None:
     )
     me = await app.bot.get_me()
     log.info("connected as @%s", me.username)
+    app.create_task(approval_watcher(app))
 
 
 def main() -> None:
@@ -599,13 +814,26 @@ def main() -> None:
         )
 
     _sessions.update(store.load_sessions())
+
+    global _run_settings, _run_mcp
+    _run_settings, _run_mcp = config.write_run_configs()
+
     log.info(
-        "workdir=%s add_dirs=%s permission_mode=%s users=%s",
+        "workdir=%s add_dirs=%s users=%s",
         config.CLAUDE_WORKDIR,
         config.CLAUDE_ADD_DIRS,
-        config.PERMISSION_MODE,
         sorted(config.ALLOWED_USER_IDS),
     )
+    if config.APPROVALS_ENABLED:
+        log.info(
+            "approvals ON — asking on Telegram for: %s (auto-allowed: %s)",
+            ", ".join(config.ASK_TOOLS),
+            ", ".join(sorted(config.AUTO_ALLOW_TOOLS)),
+        )
+    else:
+        log.warning(
+            "approvals OFF — permission_mode=%s, tools run unattended", config.PERMISSION_MODE
+        )
 
     app = (
         Application.builder()
@@ -623,6 +851,7 @@ def main() -> None:
     app.add_handler(CommandHandler("cd", cmd_cd))
     app.add_handler(CommandHandler("model", cmd_model))
     app.add_handler(CommandHandler("whoami", cmd_whoami))
+    app.add_handler(CallbackQueryHandler(on_callback))
     app.add_handler(MessageHandler(filters.PHOTO | filters.Document.ALL, on_attachment))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
     app.add_error_handler(on_error)

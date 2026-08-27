@@ -54,6 +54,9 @@ class RunSpec:
     append_system_prompt: str = ""
     max_budget_usd: float = 0.0
     timeout_seconds: int = 1800
+    settings_path: str = ""  # registers the Telegram approval hook
+    mcp_config_path: str = ""  # exposes the ask/notify tools to the run
+    env_extra: dict[str, str] = field(default_factory=dict)
 
 
 def build_argv(spec: RunSpec) -> list[str]:
@@ -94,6 +97,10 @@ def build_argv(spec: RunSpec) -> list[str]:
         argv += ["--append-system-prompt", spec.append_system_prompt]
     if spec.max_budget_usd > 0:
         argv += ["--max-budget-usd", str(spec.max_budget_usd)]
+    if spec.settings_path:
+        argv += ["--settings", spec.settings_path]
+    if spec.mcp_config_path:
+        argv += ["--mcp-config", spec.mcp_config_path]
 
     return argv
 
@@ -171,6 +178,9 @@ async def stream_run(spec: RunSpec) -> AsyncIterator[Event]:
     # it owns a TTY. Headless runs should never try to draw.
     env.setdefault("CI", "1")
     env.setdefault("TERM", "dumb")
+    # The hook and the ask-server are grandchildren of this process; this is how
+    # they learn which run and which chat they belong to.
+    env.update(spec.env_extra)
 
     try:
         proc = await asyncio.create_subprocess_exec(

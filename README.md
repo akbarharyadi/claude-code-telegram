@@ -16,6 +16,15 @@ It bridges both directions:
 - **`bot.py`** — a Telegram bot that runs Claude Code for you. Threads, screenshots, albums, live tool-by-tool progress, `/stop` to cancel.
 - **`mcp_server.py`** — an MCP server so a Claude Code session on your desktop can message you, send you an image or a file, or *ask you a question and wait for the answer*.
 
+Nothing that changes your machine runs unattended. Before any `Bash`, `Edit` or `Write`, the bot shows you the exact command or file and waits for you to tap **Allow** or **Deny** — and when Claude hits a real choice, it asks you instead of guessing:
+
+```
+🔐 Approval needed — Bash            ❓ Two ways to fix this. Which?
+   uv run alembic upgrade head
+   [ ✅ Allow ] [ ⛔ Deny ]             [ Patch the view          ]
+   [ ✅ Allow every Bash in this run ]  [ Change the caller       ]
+```
+
 Use either half on its own. They share one `.env`.
 
 ---
@@ -26,12 +35,15 @@ Use either half on its own. They share one `.env`.
 
 - `ALLOWED_USER_IDS` is mandatory. The bot refuses to start without it and ignores everyone not on the list.
 - A leaked `TELEGRAM_BOT_TOKEN` is a shell on your machine. Treat it like an SSH key. `.env` is gitignored — keep it that way.
-- Headless runs cannot show you a permission prompt, so tool access is decided up front by `CLAUDE_PERMISSION_MODE` and `CLAUDE_ALLOWED_TOOLS`. The shipped default allows `Bash`, which means arbitrary shell commands.
-- If you do not want the bot pushing commits under your git identity, set:
+- Approvals are **on** by default, so nothing destructive runs without your tap. They fail closed: a timeout, an unreachable Telegram, or a crashing hook all result in **deny**, never in a silent allow.
+- Approvals gate *your* attention, not other people's access. Anyone on `ALLOWED_USER_IDS` can approve — keep that list to yourself.
+- If you do not want the bot pushing under your git identity at all, put it out of reach rather than relying on your own vigilance:
   ```
   CLAUDE_DISALLOWED_TOOLS=Bash(git push:*),Bash(gh pr create:*),Bash(gh pr comment:*)
   ```
-- For a read-only bot that can answer questions but change nothing, set `CLAUDE_PERMISSION_MODE=plan`.
+- For a bot that answers questions but changes nothing, set `TELEGRAM_APPROVALS=0` and `CLAUDE_PERMISSION_MODE=plan`.
+
+Verify the gate on your own machine before trusting it — `uv run doctor.py` asks Claude to create a file via `Bash`, denies it, and checks the file really was not created, then repeats with allow.
 
 Messages you send pass through Telegram's servers. Do not paste secrets into the chat.
 
@@ -129,6 +141,27 @@ By default every tool is pinned to `TELEGRAM_DEFAULT_CHAT_ID`. Set `MCP_ALLOW_AN
 
 ---
 
+## Approvals and questions
+
+Two separate mechanisms, both answered with a tap:
+
+**Approvals** — a `PreToolUse` hook gates every tool in `CLAUDE_ASK_TOOLS` (`Bash`, `Edit`, `Write`, `NotebookEdit` by default). You see the exact shell command, or the file path plus a preview of what is about to be written, and choose Allow, Deny, or *Allow every `Bash` in this run* — which lasts for that one message and is forgotten when the run ends. Read-only tools in `CLAUDE_AUTO_ALLOW_TOOLS` never interrupt you.
+
+**Questions** — Claude gets two extra tools inside bot-started runs:
+
+| Tool | Purpose |
+|---|---|
+| `mcp__tg__ask_user(question, options)` | Ask you something and block. With options it renders as buttons; without, it waits for you to type. |
+| `mcp__tg__notify(text)` | A one-line status note during a long run. Does not wait. |
+
+The system prompt tells Claude to reach for `ask_user` rather than guess whenever a choice would change what it builds.
+
+Every path fails closed. If Telegram is unreachable, if you never answer, or if the hook itself crashes, the answer is **deny** — and Claude is told why, so it explains and stops rather than retrying.
+
+To turn all of this off and let runs proceed unattended, set `TELEGRAM_APPROVALS=0`.
+
+---
+
 ## Configuration
 
 Everything lives in `.env`; see [`.env.example`](.env.example) for the annotated list. The ones that matter most:
@@ -140,9 +173,13 @@ Everything lives in `.env`; see [`.env.example`](.env.example) for the annotated
 | `CLAUDE_WORKDIR` | — | The repo Claude works in. Required. |
 | `CLAUDE_ADD_DIRS` | — | Extra directories Claude may touch (sibling repos). |
 | `CLAUDE_EXTRA_WORKDIRS` | — | Targets for `/cd`. |
-| `CLAUDE_PERMISSION_MODE` | `acceptEdits` | `acceptEdits`, `bypassPermissions`, or `plan` for read-only. |
-| `CLAUDE_ALLOWED_TOOLS` | broad | Comma-separated allowlist. |
-| `CLAUDE_DISALLOWED_TOOLS` | — | Denylist, wins over the allowlist. |
+| `TELEGRAM_APPROVALS` | `1` | Ask before anything that changes state. `0` runs unattended. |
+| `CLAUDE_ASK_TOOLS` | `Bash,Edit,Write,NotebookEdit` | Tools that need your tap. |
+| `CLAUDE_AUTO_ALLOW_TOOLS` | read-only set | Tools that never interrupt you. |
+| `APPROVAL_WAIT_SECONDS` | `540` | How long a question waits. Timeout means deny. |
+| `CLAUDE_PERMISSION_MODE` | `acceptEdits` | Unattended mode only: `acceptEdits`, `bypassPermissions`, `plan`. |
+| `CLAUDE_ALLOWED_TOOLS` | broad | Unattended mode only. Comma-separated allowlist. |
+| `CLAUDE_DISALLOWED_TOOLS` | — | Denylist, applied in both modes. Wins over the allowlist. |
 | `CLAUDE_MAX_BUDGET_USD` | `0` | Per-run spend cap. `0` disables it. |
 | `CLAUDE_RUN_TIMEOUT_SECONDS` | `1800` | Kill a run that overruns. |
 | `CLAUDE_CONTEXT_NOTE` | — | Appended to the system prompt. Describe your repos here. |
@@ -156,6 +193,10 @@ Each incoming message becomes one `claude --print --output-format stream-json` s
 Session continuity uses `--session-id` on the first run of a chat and `--resume` afterwards, with the mapping persisted to `state/sessions.json`. Attachments are downloaded into `state/downloads/<chat_id>/` and that directory is passed with `--add-dir`, so Claude can read them without widening access to anything else.
 
 Replies are converted from markdown to the small HTML subset Telegram accepts, and split on line boundaries so a code block never lands half-open. If Telegram rejects the formatting anyway, the bot resends as plain text rather than dropping your answer.
+
+Approvals travel over a small file queue in `state/approvals/` rather than a socket. The hook and the ask-server are grandchildren of the bot — spawned by `claude`, which the bot spawned — and only one process may hold Telegram's `getUpdates` poll, so they cannot talk to Telegram themselves. They drop a JSON request and block; the bot presents it, and writes the answer back. The handshake is plain files on purpose: you can watch it with `ls`, and unstick a wedged run by deleting one.
+
+The hook is registered with `--settings`, generated at startup into `state/run-settings.json` so the absolute path to your Python interpreter is baked in. It uses exec form (`command` + `args`) rather than a shell string, which is what keeps a Windows path containing spaces from being mis-split.
 
 ---
 

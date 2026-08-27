@@ -11,10 +11,12 @@ from __future__ import annotations
 
 import asyncio
 import sys
+import uuid
 from pathlib import Path
 
 import httpx
 
+import bridge
 import claude_runner
 import config
 from claude_runner import RunSpec
@@ -59,11 +61,15 @@ def check_config(report: Report) -> None:
 
     choices = config.workdir_choices()
     report.line(OK, f"/cd targets: {', '.join(sorted(choices)) or '(none)'}")
-    report.line(OK, f"permission mode: {config.PERMISSION_MODE}")
-    report.line(OK, f"allowed tools: {', '.join(config.ALLOWED_TOOLS) or '(default)'}")
+
+    # Report what a run will ACTUALLY use — with approvals on, the raw
+    # CLAUDE_PERMISSION_MODE / CLAUDE_ALLOWED_TOOLS values are not applied.
+    mode = config.effective_permission_mode()
+    report.line(OK, f"permission mode: {mode or 'default (ask)'}")
+    report.line(OK, f"runs without asking: {', '.join(config.effective_allowed_tools())}")
     if config.DISALLOWED_TOOLS:
-        report.line(OK, f"denied tools: {', '.join(config.DISALLOWED_TOOLS)}")
-    elif config.PERMISSION_MODE == "bypassPermissions":
+        report.line(OK, f"always denied: {', '.join(config.DISALLOWED_TOOLS)}")
+    if not config.APPROVALS_ENABLED and mode == "bypassPermissions":
         report.line(
             WARN,
             "bypassPermissions with no denylist — anyone on ALLOWED_USER_IDS can run anything.",
@@ -122,6 +128,97 @@ async def check_claude_run(report: Report) -> None:
     report.line(OK if session_id else FAIL, f"session id captured: {session_id or '(none)'}")
 
 
+async def _auto_respond(run_id: str, decision: dict, seen: list[dict]) -> None:
+    """Stand in for the phone: answer every request this run raises."""
+    while True:
+        for request in bridge.pending():
+            if request.get("run_id") != run_id:
+                continue
+            seen.append(request)
+            bridge.respond(str(request.get("id")), decision)
+        await asyncio.sleep(0.2)
+
+
+async def _gate_probe(decision: dict, probe: Path) -> tuple[bool, list[dict], str]:
+    """Ask Claude to create a file via Bash, answer the approval with `decision`,
+    and report whether the file actually appeared."""
+    probe.unlink(missing_ok=True)
+    run_id = f"doctor-{uuid.uuid4().hex[:8]}"
+    settings_path, mcp_path = config.write_run_configs()
+    seen: list[dict] = []
+
+    spec = RunSpec(
+        prompt=(
+            "Use the Bash tool to run exactly this command, and nothing else:\n"
+            f"  echo probe > '{probe.as_posix()}'\n"
+            "Then reply with one word: done."
+        ),
+        cwd=str(config.ROOT),
+        allowed_tools=config.effective_allowed_tools(),
+        append_system_prompt=config.APPEND_SYSTEM_PROMPT,
+        timeout_seconds=180,
+        settings_path=settings_path,
+        mcp_config_path=mcp_path,
+        env_extra={
+            "CCTG_RUN_ID": run_id,
+            "CCTG_CHAT_ID": "0",
+            "CCTG_SESSION_KEY": run_id,
+        },
+    )
+
+    responder = asyncio.create_task(_auto_respond(run_id, decision, seen))
+    error = ""
+    try:
+        async for event in claude_runner.stream_run(spec):
+            if event.kind == "error":
+                error = event.text
+    except Exception as exc:  # noqa: BLE001
+        error = f"{type(exc).__name__}: {exc}"
+    finally:
+        responder.cancel()
+        bridge.clear_rules(run_id)
+
+    created = probe.exists()
+    probe.unlink(missing_ok=True)
+    return created, seen, error
+
+
+async def check_approval_gate(report: Report) -> None:
+    report.section("Approval gate")
+    if not config.APPROVALS_ENABLED:
+        report.line(
+            WARN, "TELEGRAM_APPROVALS=0 — tools run unattended, nothing is asked on Telegram."
+        )
+        return
+
+    report.line(OK, f"asks for: {', '.join(config.ASK_TOOLS)}")
+    probe = config.STATE_DIR / "gate-probe.txt"
+
+    print("        probing with DENY (the command must NOT run)…")
+    created, seen, error = await _gate_probe({"choice": "deny", "note": "doctor probe"}, probe)
+    if error:
+        report.line(FAIL, f"deny probe failed to run: {error[:300]}")
+        return
+    if not seen:
+        report.line(FAIL, "no approval was ever requested — the hook is not firing.")
+        return
+    report.line(OK, f"hook fired for: {seen[0].get('tool_name')}")
+    report.line(
+        OK if not created else FAIL,
+        "deny blocked the command" if not created else "DENY DID NOT BLOCK — the gate is open!",
+    )
+
+    print("        probing with ALLOW (the command must run)…")
+    created, seen, error = await _gate_probe({"choice": "allow"}, probe)
+    if error:
+        report.line(FAIL, f"allow probe failed to run: {error[:300]}")
+        return
+    report.line(
+        OK if created else FAIL,
+        "allow let the command through" if created else "allow did not run the command",
+    )
+
+
 async def check_telegram(report: Report) -> None:
     report.section("Telegram")
     if not config.TELEGRAM_BOT_TOKEN:
@@ -161,6 +258,7 @@ async def main() -> int:
     check_config(report)
     if check_claude_binary(report) and "--no-llm" not in sys.argv:
         await check_claude_run(report)
+        await check_approval_gate(report)
     await check_telegram(report)
 
     print()
