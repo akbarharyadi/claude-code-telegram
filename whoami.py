@@ -20,7 +20,14 @@ import httpx
 import config
 
 POLL_SECONDS = 25
-OVERALL_DEADLINE = 180
+# Generous: you may have to go and find the bot in the app first.
+OVERALL_DEADLINE = 600
+
+CONFLICT_HELP = (
+    "Another process is already polling this bot — usually bot.py, or a second\n"
+    "copy of whoami.py. Telegram allows only one getUpdates per token.\n"
+    "Stop the other one, then run this again."
+)
 
 
 async def call(method: str, params: dict | None = None) -> dict:
@@ -69,9 +76,11 @@ async def main() -> int:
         return 1
 
     username = me.get("username") or "?"
-    print(f"Bot is @{username}.")
-    print(f"Open Telegram, find @{username}, and send it any message — /start will do.")
-    print("Waiting…\n")
+    # flush=True: the interesting part of this script is the wait, and a piped
+    # or redirected run would otherwise show nothing until it finished.
+    print(f"Bot is @{username}.", flush=True)
+    print(f"Open Telegram, find @{username}, and send it any message — /start will do.", flush=True)
+    print("Waiting…\n", flush=True)
 
     offset = 0
     deadline = asyncio.get_event_loop().time() + OVERALL_DEADLINE
@@ -82,8 +91,14 @@ async def main() -> int:
             result = (await call("getUpdates", {"timeout": POLL_SECONDS, "offset": offset}))[
                 "result"
             ]
-        except (httpx.HTTPError, RuntimeError) as exc:
-            print(f"Poll failed: {exc}")
+        except RuntimeError as exc:
+            if "conflict" in str(exc).lower():
+                print(f"\n{CONFLICT_HELP}", flush=True)
+                return 1
+            print(f"Poll failed: {exc}", flush=True)
+            return 1
+        except httpx.HTTPError as exc:
+            print(f"Poll failed: {exc}", flush=True)
             return 1
 
         for update in result:
