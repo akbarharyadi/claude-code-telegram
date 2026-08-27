@@ -102,6 +102,41 @@ def test_run_context_reads_the_injected_environment(monkeypatch):
     }
 
 
+# ── browser selection ─────────────────────────────────────────────────────
+
+
+def test_browser_choice_is_remembered_then_forgotten(state):
+    assert config.remembered_device_id() == ""
+
+    config.remember_device_id("dev-123")
+    assert config.remembered_device_id() == "dev-123"
+    assert config.effective_device_id() == "dev-123"
+
+    config.forget_device_id()
+    assert config.effective_device_id() == ""
+
+
+def test_env_pin_beats_a_remembered_choice(state, monkeypatch):
+    config.remember_device_id("chosen-on-telegram")
+    monkeypatch.setattr(config, "CHROME_DEVICE_ID", "pinned-in-env")
+    assert config.effective_device_id() == "pinned-in-env"
+
+
+def test_remembering_nothing_is_a_no_op(state):
+    config.remember_device_id("")
+    assert config.remembered_device_id() == ""
+
+
+def test_auto_allow_accepts_a_whole_mcp_server(monkeypatch):
+    monkeypatch.setattr(config, "AUTO_ALLOW_TOOLS", {"Read", "mcp__claude-in-chrome"})
+
+    assert config.is_auto_allowed("Read")
+    assert config.is_auto_allowed("mcp__claude-in-chrome__computer")
+    assert not config.is_auto_allowed("Bash")
+    # A server entry must not match a different server that merely shares a prefix.
+    assert not config.is_auto_allowed("mcp__claude-in-chrome-other__computer")
+
+
 # ── the hook's contract with Claude Code ──────────────────────────────────
 
 

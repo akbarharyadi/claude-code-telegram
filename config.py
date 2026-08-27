@@ -158,6 +158,41 @@ _APPROVAL_ETIQUETTE = (
     "If an approval is refused or times out, do not retry the same call — explain and stop."
 )
 
+def remembered_device_id() -> str:
+    """The browser you last picked on Telegram.
+
+    The Chrome tools cannot remember a selection across runs, and every run is a
+    fresh process — so without this you would be asked which browser on every
+    single message. The hook records your choice; this reads it back.
+    """
+    try:
+        data = json.loads((STATE_DIR / "chrome.json").read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return ""
+    return str(data.get("device_id") or "") if isinstance(data, dict) else ""
+
+
+def remember_device_id(device_id: str) -> None:
+    if not device_id:
+        return
+    ensure_dirs()
+    (STATE_DIR / "chrome.json").write_text(
+        json.dumps({"device_id": device_id}, indent=2), encoding="utf-8"
+    )
+
+
+def forget_device_id() -> None:
+    try:
+        (STATE_DIR / "chrome.json").unlink()
+    except OSError:
+        pass
+
+
+def effective_device_id() -> str:
+    """An explicit .env pin wins; otherwise whatever you last chose."""
+    return CHROME_DEVICE_ID or remembered_device_id()
+
+
 def _chrome_etiquette() -> str:
     if not ENABLE_CHROME:
         return ""
@@ -169,10 +204,11 @@ def _chrome_etiquette() -> str:
         "tool instructs you to ask the user something — such as which connected browser to "
         "drive — call mcp__tg__ask_user with those same options instead, and act on the reply.",
     ]
-    if CHROME_DEVICE_ID:
+    device_id = effective_device_id()
+    if device_id:
         lines.append(
             "The user has already chosen their browser: call "
-            f"mcp__claude-in-chrome__select_browser with deviceId {CHROME_DEVICE_ID} before any "
+            f"mcp__claude-in-chrome__select_browser with deviceId {device_id} before any "
             "other browser tool, and do not ask which browser to use."
         )
     return " ".join(lines)
@@ -186,16 +222,19 @@ _TELEGRAM_ETIQUETTE = (
     "When you change files, end with a one-line-per-file list of what changed and why. "
     "Never print secrets, tokens, or the contents of .env files into the chat."
 )
-APPEND_SYSTEM_PROMPT = "\n\n".join(
-    part
-    for part in (
-        _TELEGRAM_ETIQUETTE,
-        _APPROVAL_ETIQUETTE if APPROVALS_ENABLED else "",
-        _chrome_etiquette(),
-        CONTEXT_NOTE,
+def append_system_prompt() -> str:
+    """Built per run, not frozen at import: the browser you picked mid-session
+    has to reach the next run without restarting the bot."""
+    return "\n\n".join(
+        part
+        for part in (
+            _TELEGRAM_ETIQUETTE,
+            _APPROVAL_ETIQUETTE if APPROVALS_ENABLED else "",
+            _chrome_etiquette(),
+            CONTEXT_NOTE,
+        )
+        if part
     )
-    if part
-)
 
 
 def is_auto_allowed(tool_name: str) -> bool:

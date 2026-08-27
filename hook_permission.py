@@ -40,17 +40,22 @@ def passthrough() -> None:
     raise SystemExit(0)
 
 
-def allow(tool_name: str) -> None:
-    """Permit the call — opening Chrome first if the call needs a browser.
+def allow(tool_name: str, tool_input: dict | None = None) -> None:
+    """Permit the call, doing the two browser chores that have to happen here.
 
-    Done here, at the last moment before the tool runs, so a browser is only
-    started for a call that was actually approved.
+    This is the last point before the tool actually runs, which makes it the
+    right place to start Chrome (never for a call that was denied), and the only
+    place that sees which browser was chosen.
     """
-    if (
-        config.ENABLE_CHROME
-        and config.CHROME_AUTOSTART
-        and tool_name.startswith(f"{config.CHROME_SERVER}__")
-    ):
+    if not tool_name.startswith(f"{config.CHROME_SERVER}__"):
+        decide("allow")
+
+    if tool_name == f"{config.CHROME_SERVER}__select_browser":
+        # Remember it, so the next run does not have to ask again. Every run is
+        # a fresh process and the Chrome tools keep no selection of their own.
+        config.remember_device_id(str((tool_input or {}).get("deviceId") or ""))
+
+    if config.ENABLE_CHROME and config.CHROME_AUTOSTART:
         import chrome  # local: nothing else in this hot path needs it
 
         chrome.ensure_sync()
@@ -107,10 +112,10 @@ def main() -> None:
         passthrough()
 
     if config.is_auto_allowed(tool_name):
-        allow(tool_name)
+        allow(tool_name, tool_input)
 
     if bridge.tool_allowed_for_run(run_id, tool_name):
-        allow(tool_name)
+        allow(tool_name, tool_input)
 
     request_id = bridge.submit(
         {
@@ -133,9 +138,9 @@ def main() -> None:
     choice = str(response.get("choice") or "deny")
     if choice == "allow_always":
         bridge.allow_tool_for_run(run_id, tool_name)
-        allow(tool_name)
+        allow(tool_name, tool_input)
     if choice == "allow":
-        allow(tool_name)
+        allow(tool_name, tool_input)
 
     note = str(response.get("note") or "").strip()
     decide("deny", note or "The user declined this on Telegram.")

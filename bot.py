@@ -225,7 +225,7 @@ async def run_job(update: Update, context: ContextTypes.DEFAULT_TYPE, prompt: st
         permission_mode=config.effective_permission_mode(),
         allowed_tools=config.effective_allowed_tools(),
         disallowed_tools=config.DISALLOWED_TOOLS,
-        append_system_prompt=config.APPEND_SYSTEM_PROMPT,
+        append_system_prompt=config.append_system_prompt(),
         max_budget_usd=config.MAX_BUDGET_USD,
         timeout_seconds=config.RUN_TIMEOUT_SECONDS,
         settings_path=_run_settings,
@@ -700,10 +700,28 @@ async def cmd_chrome(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         )
         return
 
+    if (context.args or [""])[0].lower() in {"forget", "reset", "clear"}:
+        config.forget_device_id()
+        await update.effective_message.reply_text(
+            "🔁 Forgotten. You will be asked which browser on the next browser task."
+        )
+        return
+
     message = await update.effective_message.reply_text("🌐 Checking Chrome…")
     running, note = await chrome.ensure()
-    icon = "✅" if running else "⚠️"
-    await message.edit_text(f"{icon} Chrome: {html.escape(note)}", parse_mode=ParseMode.HTML)
+
+    device_id = config.effective_device_id()
+    if device_id:
+        pinned = "pinned in .env" if config.CHROME_DEVICE_ID else "chosen by you"
+        browser = f"\n<b>Browser</b> <code>{html.escape(device_id)}</code> ({pinned})"
+        browser += "\nSend <code>/chrome forget</code> to be asked again."
+    else:
+        browser = "\n<b>Browser</b> not chosen yet — you will be asked on the first browser task."
+
+    await message.edit_text(
+        f"{'✅' if running else '⚠️'} Chrome: {html.escape(note)}{browser}",
+        parse_mode=ParseMode.HTML,
+    )
 
 
 async def cmd_whoami(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:

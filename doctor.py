@@ -155,7 +155,7 @@ async def _gate_probe(decision: dict, probe: Path) -> tuple[bool, list[dict], st
         ),
         cwd=str(config.ROOT),
         allowed_tools=config.effective_allowed_tools(),
-        append_system_prompt=config.APPEND_SYSTEM_PROMPT,
+        append_system_prompt=config.append_system_prompt(),
         timeout_seconds=180,
         settings_path=settings_path,
         mcp_config_path=mcp_path,
@@ -191,7 +191,7 @@ async def check_approval_gate(report: Report) -> None:
         )
         return
 
-    report.line(OK, f"asks for: {', '.join(config.ASK_TOOLS)}")
+    report.line(OK, f"asks for: {', '.join(config.effective_ask_tools())}")
     probe = config.STATE_DIR / "gate-probe.txt"
 
     print("        probing with DENY (the command must NOT run)…")

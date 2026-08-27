@@ -170,6 +170,10 @@ By default the Claude in Chrome tools are **not present in a bot run at all** �
 
 Set `CLAUDE_ENABLE_CHROME=1` and the bot passes `--chrome`, handing Claude the browser you are already signed into. You also need the [Claude in Chrome](https://claude.com/chrome) extension installed, with the site permitted in it.
 
+If Chrome is not running when an approved browser call is about to execute, the bot starts it — detached, so stopping the bot does not close your browser. `/chrome` opens or checks it by hand.
+
+With more than one browser connected, none is selected by default and every browser tool quietly sees nothing. The Chrome tools resolve that by asking the user, which nothing can answer in a headless run — so the bot routes that question to Telegram, where it arrives as buttons. Your answer is remembered, so you are asked once, not once per message. `/chrome forget` makes it ask again.
+
 These tools act as you on every site you are signed into, so they are gated by the approval hook like `Bash` is. If the prompts get tiring, add the whole server to the auto-allow list:
 
 ```
