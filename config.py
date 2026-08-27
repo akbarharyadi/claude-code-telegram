@@ -249,7 +249,7 @@ def missing_settings() -> list[str]:
     if not ALLOWED_USER_IDS:
         problems.append(
             "ALLOWED_USER_IDS is empty — the bot would accept commands from anyone. "
-            "Send /start to the bot to learn your numeric user id, then fill it in."
+            "Run `uv run whoami.py` to look up your id and fill it in."
         )
     if not CLAUDE_WORKDIR:
         problems.append(

@@ -79,10 +79,10 @@ Edit `.env` and set at minimum `TELEGRAM_BOT_TOKEN` and `CLAUDE_WORKDIR`.
 **3. Find your user id**
 
 ```bash
-uv run bot.py
+uv run whoami.py
 ```
 
-It will refuse to start while `ALLOWED_USER_IDS` is empty — that is deliberate. Set it to any value for a moment (e.g. `1`), start the bot, send it `/start`, and it replies with your real numeric id. Put that in `ALLOWED_USER_IDS`, and the same chat id in `TELEGRAM_DEFAULT_CHAT_ID`, then restart.
+It tells you to message the bot, catches that message, prints your user and chat ids, and offers to write them into `.env`. No bot has to be running — which matters, because the bot deliberately refuses to start while `ALLOWED_USER_IDS` is empty.
 
 **4. Talk to it**
 
