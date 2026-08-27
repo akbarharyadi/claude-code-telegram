@@ -56,6 +56,7 @@ class RunSpec:
     timeout_seconds: int = 1800
     settings_path: str = ""  # registers the Telegram approval hook
     mcp_config_path: str = ""  # exposes the ask/notify tools to the run
+    enable_chrome: bool = False  # drive the operator's logged-in Chrome
     env_extra: dict[str, str] = field(default_factory=dict)
 
 
@@ -101,6 +102,10 @@ def build_argv(spec: RunSpec) -> list[str]:
         argv += ["--settings", spec.settings_path]
     if spec.mcp_config_path:
         argv += ["--mcp-config", spec.mcp_config_path]
+    if spec.enable_chrome:
+        # Without this the Chrome tools are simply absent, and Claude silently
+        # falls back to whatever headless browser it can find.
+        argv += ["--chrome"]
 
     return argv
 

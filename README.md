@@ -164,6 +164,20 @@ To turn all of this off and let runs proceed unattended, set `TELEGRAM_APPROVALS
 
 ---
 
+## Browsing a page that needs a login
+
+By default the Claude in Chrome tools are **not present in a bot run at all** — the CLI only exposes them with `--chrome`. Without them, asking for a screenshot makes Claude fall back to a headless browser, whose cookie jar is empty, so anything behind a login is out of reach.
+
+Set `CLAUDE_ENABLE_CHROME=1` and the bot passes `--chrome`, handing Claude the browser you are already signed into. You also need the [Claude in Chrome](https://claude.com/chrome) extension installed, with the site permitted in it.
+
+These tools act as you on every site you are signed into, so they are gated by the approval hook like `Bash` is. If the prompts get tiring, add the whole server to the auto-allow list:
+
+```
+CLAUDE_AUTO_ALLOW_TOOLS=Read,Grep,Glob,TodoWrite,Task,WebSearch,WebFetch,NotebookRead,BashOutput,KillShell,mcp__claude-in-chrome
+```
+
+---
+
 ## Configuration
 
 Everything lives in `.env`; see [`.env.example`](.env.example) for the annotated list. The ones that matter most:

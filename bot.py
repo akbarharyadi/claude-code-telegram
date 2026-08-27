@@ -229,6 +229,7 @@ async def run_job(update: Update, context: ContextTypes.DEFAULT_TYPE, prompt: st
         timeout_seconds=config.RUN_TIMEOUT_SECONDS,
         settings_path=_run_settings,
         mcp_config_path=_run_mcp,
+        enable_chrome=config.ENABLE_CHROME,
         env_extra={
             "CCTG_RUN_ID": run_id,
             "CCTG_CHAT_ID": str(message.chat_id),
@@ -372,10 +373,20 @@ async def flush_media_group(
 _ask_options: dict[str, list[str]] = {}
 
 
+def short_tool(tool: str) -> str:
+    """`mcp__claude-in-chrome__computer` reads as noise on a phone; show
+    `computer · claude-in-chrome` instead."""
+    if tool.startswith("mcp__"):
+        parts = tool.split("__")
+        if len(parts) >= 3:
+            return f"{parts[-1]} · {parts[1]}"
+    return tool
+
+
 def _render_permission(request: dict) -> str:
     tool = str(request.get("tool_name") or "tool")
     summary = request.get("summary") or {}
-    lines = [f"🔐 <b>Approval needed</b> — <b>{html.escape(tool)}</b>"]
+    lines = [f"🔐 <b>Approval needed</b> — <b>{html.escape(short_tool(tool))}</b>"]
 
     if tool == "Bash":
         note = summary.get("note") or ""
@@ -408,7 +419,8 @@ def _permission_keyboard(request_id: str, tool: str) -> InlineKeyboardMarkup:
             ],
             [
                 InlineKeyboardButton(
-                    f"✅ Allow every {tool} in this run", callback_data=f"p:{request_id}:A"
+                    f"✅ Allow every {short_tool(tool)} in this run",
+                    callback_data=f"p:{request_id}:A",
                 )
             ],
         ]
@@ -607,7 +619,7 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     task = _jobs.get(key)
     running = "yes" if task and not task.done() else "no"
     if config.APPROVALS_ENABLED:
-        gate = f"ask me for {', '.join(config.ASK_TOOLS)}"
+        gate = f"ask me for {', '.join(short_tool(t) for t in config.effective_ask_tools())}"
     else:
         gate = f"unattended ({config.PERMISSION_MODE})"
     await update.effective_message.reply_text(
@@ -860,7 +872,7 @@ def main() -> None:
     if config.APPROVALS_ENABLED:
         log.info(
             "approvals ON — asking on Telegram for: %s (auto-allowed: %s)",
-            ", ".join(config.ASK_TOOLS),
+            ", ".join(config.effective_ask_tools()),
             ", ".join(sorted(config.AUTO_ALLOW_TOOLS)),
         )
     else:

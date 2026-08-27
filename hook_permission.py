@@ -89,7 +89,7 @@ def main() -> None:
         # settings loaded). Do not hijack their permission prompts.
         passthrough()
 
-    if tool_name in config.AUTO_ALLOW_TOOLS:
+    if config.is_auto_allowed(tool_name):
         decide("allow")
 
     if bridge.tool_allowed_for_run(run_id, tool_name):

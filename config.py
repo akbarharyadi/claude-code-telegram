@@ -127,6 +127,14 @@ AUTO_ALLOW_TOOLS = set(
     ]
 )
 
+# Claude in Chrome drives the browser you are already logged into, so a
+# screenshot of an authenticated page works where a headless browser — with an
+# empty cookie jar — only ever reaches the login screen. Off by default: it
+# needs the Chrome extension installed and the site permitted in it.
+ENABLE_CHROME = _bool(os.getenv("CLAUDE_ENABLE_CHROME"), False)
+CHROME_SERVER = "mcp__claude-in-chrome"
+CHROME_TOOL_PATTERN = f"{CHROME_SERVER}__.*"
+
 APPROVAL_WAIT_SECONDS = _float(os.getenv("APPROVAL_WAIT_SECONDS"), 540.0)
 ASK_WAIT_SECONDS = _float(os.getenv("ASK_WAIT_SECONDS"), 540.0)
 # The hook must outlive its own wait, or Claude Code kills it before it answers.
@@ -162,11 +170,33 @@ APPEND_SYSTEM_PROMPT = "\n\n".join(
 )
 
 
+def is_auto_allowed(tool_name: str) -> bool:
+    """Exact tool names, plus whole-MCP-server entries.
+
+    Listing `mcp__claude-in-chrome` in CLAUDE_AUTO_ALLOW_TOOLS covers every tool
+    that server exposes — the same shorthand the CLI's own allowlist accepts.
+    """
+    if tool_name in AUTO_ALLOW_TOOLS:
+        return True
+    return any(
+        entry.startswith("mcp__") and tool_name.startswith(f"{entry}__")
+        for entry in AUTO_ALLOW_TOOLS
+    )
+
+
+def effective_ask_tools() -> list[str]:
+    """Hook matchers. Chrome is regex because it is a whole server of tools."""
+    tools = list(ASK_TOOLS)
+    if ENABLE_CHROME and not is_auto_allowed(f"{CHROME_SERVER}__computer"):
+        tools.append(CHROME_TOOL_PATTERN)
+    return tools
+
+
 def effective_allowed_tools() -> list[str]:
     """With approvals on, the gated tools are deliberately absent: the hook's
     `allow` is what lets them run, so a broken hook fails closed."""
     if not APPROVALS_ENABLED:
-        return ALLOWED_TOOLS
+        return ALLOWED_TOOLS + ([CHROME_SERVER] if ENABLE_CHROME else [])
     return sorted(AUTO_ALLOW_TOOLS) + ASK_SERVER_TOOLS
 
 
@@ -215,7 +245,7 @@ def write_run_configs() -> tuple[str, str]:
         "hooks": {
             "PreToolUse": [
                 {
-                    "matcher": "|".join(ASK_TOOLS),
+                    "matcher": "|".join(effective_ask_tools()),
                     "hooks": [
                         {
                             "type": "command",
