@@ -9,6 +9,7 @@ Run with:  uv run bot.py
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import html
 import logging
 import time
@@ -52,6 +53,7 @@ _run_settings = ""
 _run_mcp = ""
 _seen_requests: dict[str, float] = {}
 _awaiting_text: dict[str, str] = {}  # session key -> request id awaiting a typed answer
+_watcher_task: asyncio.Task | None = None
 
 
 # ── access control ────────────────────────────────────────────────────────
@@ -788,7 +790,29 @@ async def post_init(app: Application) -> None:
     )
     me = await app.bot.get_me()
     log.info("connected as @%s", me.username)
-    app.create_task(approval_watcher(app))
+
+    # Plain asyncio, not Application.create_task: post_init runs before the
+    # application is started, and PTB will not adopt a task created that early.
+    # We own its lifetime instead and cancel it in post_stop.
+    global _watcher_task
+    _watcher_task = asyncio.create_task(approval_watcher(app))
+
+
+async def post_stop(app: Application) -> None:
+    global _watcher_task
+    if _watcher_task is not None and not _watcher_task.done():
+        _watcher_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await _watcher_task
+    _watcher_task = None
+
+    # Anything still waiting on an answer would otherwise block its hook for the
+    # full APPROVAL_WAIT_SECONDS. Refuse them on the way out.
+    for request in bridge.pending():
+        bridge.respond(
+            str(request.get("id")),
+            {"choice": "deny", "note": "The Telegram bot shut down before you answered."},
+        )
 
 
 def main() -> None:
@@ -840,6 +864,7 @@ def main() -> None:
         .token(config.TELEGRAM_BOT_TOKEN)
         .concurrent_updates(True)  # so /stop is answerable while a run is in flight
         .post_init(post_init)
+        .post_stop(post_stop)
         .build()
     )
 
