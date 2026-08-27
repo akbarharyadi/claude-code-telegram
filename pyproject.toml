@@ -23,8 +23,8 @@ dependencies = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/OWNER/claude-code-telegram"
-Issues = "https://github.com/OWNER/claude-code-telegram/issues"
+Homepage = "https://github.com/akbarharyadi/claude-code-telegram"
+Issues = "https://github.com/akbarharyadi/claude-code-telegram/issues"
 
 [dependency-groups]
 dev = ["pytest>=8.0", "ruff>=0.6"]

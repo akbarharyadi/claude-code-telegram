@@ -27,6 +27,8 @@ Nothing that changes your machine runs unattended. Before any `Bash`, `Edit` or 
 
 Use either half on its own. They share one `.env`.
 
+New here? [**TODO.md**](TODO.md) is a ten-minute setup checklist, plus an honest list of what is not verified yet.
+
 ---
 
 ## ⚠️ Read this before you install
@@ -69,7 +71,7 @@ Message [@BotFather](https://t.me/BotFather) → `/newbot` → pick a name and u
 **2. Configure**
 
 ```bash
-git clone https://github.com/OWNER/claude-code-telegram.git
+git clone https://github.com/akbarharyadi/claude-code-telegram.git
 cd claude-code-telegram
 cp .env.example .env
 ```
