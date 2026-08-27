@@ -29,6 +29,7 @@ from telegram.ext import (
 )
 
 import bridge
+import chrome
 import claude_runner
 import config
 import store
@@ -689,6 +690,22 @@ async def cmd_model(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.effective_message.reply_text(f"Model set to {session.model or 'default'}.")
 
 
+async def cmd_chrome(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not is_authorized(update):
+        return
+    if not config.ENABLE_CHROME:
+        await update.effective_message.reply_text(
+            "Chrome tools are off. Set CLAUDE_ENABLE_CHROME=1 in .env and restart, "
+            "otherwise browsing falls back to a headless browser that cannot log in."
+        )
+        return
+
+    message = await update.effective_message.reply_text("🌐 Checking Chrome…")
+    running, note = await chrome.ensure()
+    icon = "✅" if running else "⚠️"
+    await message.edit_text(f"{icon} Chrome: {html.escape(note)}", parse_mode=ParseMode.HTML)
+
+
 async def cmd_whoami(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
     chat = update.effective_chat
@@ -796,6 +813,7 @@ async def post_init(app: Application) -> None:
             BotCommand("stop", "Cancel the current run"),
             BotCommand("cd", "Switch repository"),
             BotCommand("model", "Override the model"),
+            BotCommand("chrome", "Open or check the browser"),
             BotCommand("whoami", "Show your Telegram ids"),
             BotCommand("help", "Show help"),
         ]
@@ -869,6 +887,13 @@ def main() -> None:
         config.CLAUDE_ADD_DIRS,
         sorted(config.ALLOWED_USER_IDS),
     )
+    if config.ENABLE_CHROME:
+        binary = chrome.find_binary()
+        log.info(
+            "chrome ON — autostart=%s binary=%s",
+            config.CHROME_AUTOSTART,
+            binary or "NOT FOUND (set CLAUDE_CHROME_BINARY)",
+        )
     if config.APPROVALS_ENABLED:
         log.info(
             "approvals ON — asking on Telegram for: %s (auto-allowed: %s)",
@@ -896,6 +921,7 @@ def main() -> None:
     app.add_handler(CommandHandler("stop", cmd_stop))
     app.add_handler(CommandHandler("cd", cmd_cd))
     app.add_handler(CommandHandler("model", cmd_model))
+    app.add_handler(CommandHandler("chrome", cmd_chrome))
     app.add_handler(CommandHandler("whoami", cmd_whoami))
     app.add_handler(CallbackQueryHandler(on_callback))
     app.add_handler(MessageHandler(filters.PHOTO | filters.Document.ALL, on_attachment))

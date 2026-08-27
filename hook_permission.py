@@ -40,6 +40,23 @@ def passthrough() -> None:
     raise SystemExit(0)
 
 
+def allow(tool_name: str) -> None:
+    """Permit the call — opening Chrome first if the call needs a browser.
+
+    Done here, at the last moment before the tool runs, so a browser is only
+    started for a call that was actually approved.
+    """
+    if (
+        config.ENABLE_CHROME
+        and config.CHROME_AUTOSTART
+        and tool_name.startswith(f"{config.CHROME_SERVER}__")
+    ):
+        import chrome  # local: nothing else in this hot path needs it
+
+        chrome.ensure_sync()
+    decide("allow")
+
+
 def summarize(tool_name: str, tool_input: dict) -> dict:
     """The few fields worth putting on a phone screen."""
     if not isinstance(tool_input, dict):
@@ -90,10 +107,10 @@ def main() -> None:
         passthrough()
 
     if config.is_auto_allowed(tool_name):
-        decide("allow")
+        allow(tool_name)
 
     if bridge.tool_allowed_for_run(run_id, tool_name):
-        decide("allow")
+        allow(tool_name)
 
     request_id = bridge.submit(
         {
@@ -116,9 +133,9 @@ def main() -> None:
     choice = str(response.get("choice") or "deny")
     if choice == "allow_always":
         bridge.allow_tool_for_run(run_id, tool_name)
-        decide("allow")
+        allow(tool_name)
     if choice == "allow":
-        decide("allow")
+        allow(tool_name)
 
     note = str(response.get("note") or "").strip()
     decide("deny", note or "The user declined this on Telegram.")

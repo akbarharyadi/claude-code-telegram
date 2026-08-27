@@ -132,6 +132,13 @@ AUTO_ALLOW_TOOLS = set(
 # empty cookie jar — only ever reaches the login screen. Off by default: it
 # needs the Chrome extension installed and the site permitted in it.
 ENABLE_CHROME = _bool(os.getenv("CLAUDE_ENABLE_CHROME"), False)
+# Start Chrome if it is not running, rather than letting the run fall back to a
+# headless browser that cannot see anything behind a login.
+CHROME_AUTOSTART = _bool(os.getenv("CLAUDE_CHROME_AUTOSTART"), True)
+CHROME_BINARY = _clean(os.getenv("CLAUDE_CHROME_BINARY"))
+# Pin which connected browser to drive. Without it, every run has to ask you
+# again, because the choice cannot be remembered across runs.
+CHROME_DEVICE_ID = _clean(os.getenv("CLAUDE_CHROME_DEVICE_ID"))
 CHROME_SERVER = "mcp__claude-in-chrome"
 CHROME_TOOL_PATTERN = f"{CHROME_SERVER}__.*"
 
@@ -151,6 +158,26 @@ _APPROVAL_ETIQUETTE = (
     "If an approval is refused or times out, do not retry the same call — explain and stop."
 )
 
+def _chrome_etiquette() -> str:
+    if not ENABLE_CHROME:
+        return ""
+    lines = [
+        "Browser work goes through the Claude in Chrome tools, which drive a browser the "
+        "user is already signed into — prefer them over any headless browser or browsing "
+        "skill, which cannot reach a page behind a login.",
+        "Nobody can answer an interactive prompt here, so AskUserQuestion is useless. When a "
+        "tool instructs you to ask the user something — such as which connected browser to "
+        "drive — call mcp__tg__ask_user with those same options instead, and act on the reply.",
+    ]
+    if CHROME_DEVICE_ID:
+        lines.append(
+            "The user has already chosen their browser: call "
+            f"mcp__claude-in-chrome__select_browser with deviceId {CHROME_DEVICE_ID} before any "
+            "other browser tool, and do not ask which browser to use."
+        )
+    return " ".join(lines)
+
+
 CONTEXT_NOTE = _clean(os.getenv("CLAUDE_CONTEXT_NOTE"))
 _TELEGRAM_ETIQUETTE = (
     "You are replying through a Telegram bot, read on a phone. "
@@ -164,6 +191,7 @@ APPEND_SYSTEM_PROMPT = "\n\n".join(
     for part in (
         _TELEGRAM_ETIQUETTE,
         _APPROVAL_ETIQUETTE if APPROVALS_ENABLED else "",
+        _chrome_etiquette(),
         CONTEXT_NOTE,
     )
     if part
