@@ -798,6 +798,22 @@ async def post_init(app: Application) -> None:
     _watcher_task = asyncio.create_task(approval_watcher(app))
 
 
+def deny_pending() -> int:
+    """Refuse anything still waiting for an answer.
+
+    A hook blocked on approval would otherwise sit out the full
+    APPROVAL_WAIT_SECONDS after the bot is already gone.
+    """
+    refused = 0
+    for request in bridge.pending():
+        bridge.respond(
+            str(request.get("id")),
+            {"choice": "deny", "note": "The Telegram bot shut down before you answered."},
+        )
+        refused += 1
+    return refused
+
+
 async def post_stop(app: Application) -> None:
     global _watcher_task
     if _watcher_task is not None and not _watcher_task.done():
@@ -805,14 +821,7 @@ async def post_stop(app: Application) -> None:
         with contextlib.suppress(asyncio.CancelledError):
             await _watcher_task
     _watcher_task = None
-
-    # Anything still waiting on an answer would otherwise block its hook for the
-    # full APPROVAL_WAIT_SECONDS. Refuse them on the way out.
-    for request in bridge.pending():
-        bridge.respond(
-            str(request.get("id")),
-            {"choice": "deny", "note": "The Telegram bot shut down before you answered."},
-        )
+    deny_pending()
 
 
 def main() -> None:
@@ -881,7 +890,19 @@ def main() -> None:
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
     app.add_error_handler(on_error)
 
-    app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
+    try:
+        app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
+    except KeyboardInterrupt:
+        # PTB catches the first Ctrl+C, but a second one — or one that lands while
+        # its shutdown is already running — escapes from inside PTB's own finally
+        # block. That is an ordinary stop, not a crash; do not print a traceback.
+        log.info("interrupted during shutdown")
+    finally:
+        # post_stop may not have run if the interrupt arrived mid-shutdown.
+        refused = deny_pending()
+        if refused:
+            log.info("refused %d approval request(s) left waiting", refused)
+        log.info("stopped")
 
 
 if __name__ == "__main__":

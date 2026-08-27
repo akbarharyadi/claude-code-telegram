@@ -33,7 +33,8 @@ Two lists: what **you** do to get running, and what **this project** still needs
 Honest status. Contributions very welcome — open an issue first if it is a big one.
 
 ### Not yet verified
-- [ ] **macOS and Linux.** Developed and exercised on Windows. CI runs the unit tests on Ubuntu, but nobody has driven the bot end to end there.
+- [x] ~~**Windows, end to end.**~~ Verified 2026-08-27: approval buttons, callbacks, screenshot upload and multi-turn sessions all exercised against a real bot.
+- [ ] **macOS and Linux.** Developed and exercised on Windows only. CI runs the unit tests on Ubuntu, but nobody has driven the bot end to end there.
 - [ ] **Group chats and forum topics.** The code keys a session per `chat_id:thread_id` and should work, but it has only been used one-to-one.
 - [ ] **Long albums** (10+ images at once) against the debounce window.
 
