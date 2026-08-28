@@ -147,7 +147,9 @@ Two modes:
 
 `gh pr review --approve` is not a comment. It is **your** approval: it satisfies CODEOWNERS, it can unblock branch protection, and to everyone else on the PR it looks exactly like you read the code and signed off.
 
-So every review this posts carries a line saying it was automated, and in `approve` mode says plainly that nothing read the diff. Leave that in. Your teammates are relying on the approval meaning something, and the disclosure is what keeps it from being a lie told in your name.
+In `quick` mode the body is simply the review — Claude read the diff, the findings are real, and it goes out as your own tool-assisted work, the same as any linter you run before signing off.
+
+`approve` mode is a different thing. Nothing read the diff, so a bare approval would assert a review that never happened. Those bodies carry a line saying so, and it is worth leaving in: your teammates are relying on the approval meaning something.
 
 The guardrails that are already there:
 
@@ -155,7 +157,7 @@ The guardrails that are already there:
 - PRs you authored are skipped; GitHub rejects a self-review anyway.
 - Drafts are skipped (`REVIEW_SKIP_DRAFTS=0` to include them).
 - A PR is reviewed once per head commit, so a re-run costs nothing until someone pushes.
-- A diff too big to read is never approved — over GitHub's 20,000-line API cap, or past `MAX_DIFF_CHARS`, it downgrades to a comment saying a person needs to look.
+- A diff too big to read is never approved — over GitHub's 20,000-line API cap, or past `MAX_DIFF_CHARS` (1.5M, about 380k tokens), it downgrades to a comment saying a person needs to look. Keep that limit generous: set it too low and Claude sees half a diff, correctly reports it cannot verify the change, and you get a useless comment instead of a verdict.
 - Claude never gets the credential. It returns a verdict; a separate function runs `gh`. A diff that tries to talk the reviewer into something cannot reach the command line.
 
 Start with a dry run. With `REVIEW_WATCH=1` the bot sweeps the moment it starts, so do this from the terminal *before* starting it — it posts nothing:

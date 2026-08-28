@@ -30,9 +30,12 @@ from claude_runner import RunSpec, stream_run
 
 GH_BIN = shutil.which("gh") or "gh"
 
-# A diff big enough to blow the context window is also a diff no skim should
-# approve. Past this we stop and say so rather than guess.
-MAX_DIFF_CHARS = 200_000
+# Roughly 380k tokens of the model's 1M window, leaving room for the reply.
+# Set this too low and the model sees a half-diff, correctly reports it cannot
+# verify the change, and you get a useless "comment" instead of a verdict — so
+# it wants to be generous. Past it we still refuse to approve what we only
+# partly read.
+MAX_DIFF_CHARS = 1_500_000
 
 _VERDICTS = ("approve", "request_changes", "comment")
 
@@ -299,11 +302,11 @@ async def ask_claude(pr: PullRequest, diff: str) -> Verdict:
 
 # ── the review body ───────────────────────────────────────────────────────
 
-_READ_BY_CLAUDE = (
-    "_Automated review: Claude Code read this diff and posted this under my "
-    "account. No human has read it — ping me if you want a person to look._"
-)
-
+# In `quick` mode the review body is just the review: Claude actually read the
+# diff, the findings are real, and it goes out as your own tool-assisted work.
+#
+# `approve` mode is different in kind. Nothing read the diff, so a bare approval
+# would assert a review that never happened — this line is what keeps it honest.
 _READ_BY_NOBODY = (
     "_Automated approval: posted by a bot under my account to keep the queue "
     "moving. **This is not a code review** — nothing, human or model, read this "
@@ -312,16 +315,17 @@ _READ_BY_NOBODY = (
 
 
 def render_body(verdict: Verdict) -> str:
-    """The comment that goes on the PR. Always carries the disclosure."""
+    """The comment that goes on the PR."""
     lines: list[str] = []
     if verdict.summary:
         lines.append(verdict.summary)
     if verdict.findings:
         lines.append("")
         lines += [f"- {finding}" for finding in verdict.findings]
-    lines.append("")
-    lines.append("---")
-    lines.append(_READ_BY_NOBODY if verdict.unread else _READ_BY_CLAUDE)
+    if verdict.unread:
+        lines.append("")
+        lines.append("---")
+        lines.append(_READ_BY_NOBODY)
     return "\n".join(lines).strip()
 
 

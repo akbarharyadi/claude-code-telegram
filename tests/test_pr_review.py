@@ -52,10 +52,10 @@ def test_non_list_findings_are_coerced():
     assert verdict.findings == ["just one"]
 
 
-def test_every_body_carries_a_disclosure():
+def test_a_reviewed_body_is_just_the_review():
+    """quick mode is your own tool-assisted work — no footer on it."""
     body = pr_review.render_body(Verdict(verdict="approve", summary="Fine."))
-    assert "Automated review" in body
-    assert "No human has read it" in body
+    assert body == "Fine."
 
 
 def test_the_unread_body_says_nothing_read_it():
