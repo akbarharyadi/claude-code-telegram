@@ -151,7 +151,7 @@ So every review this posts carries a line saying it was automated, and in `appro
 
 The guardrails that are already there:
 
-- Whoever `gh auth status` says you are is who approves — **check that first**, especially if you are logged into more than one account.
+- Whoever `gh auth status` says you are is who approves. Set `REVIEW_LOGIN` to the account you mean and the sweep refuses to run unless `gh` is actually signed in as them — otherwise switching accounts for an unrelated `git push` would file approvals under the wrong name.
 - PRs you authored are skipped; GitHub rejects a self-review anyway.
 - Drafts are skipped (`REVIEW_SKIP_DRAFTS=0` to include them).
 - A PR is reviewed once per head commit, so a re-run costs nothing until someone pushes.

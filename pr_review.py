@@ -400,7 +400,19 @@ async def sweep(
     if not config.REVIEW_REPOS:
         raise ReviewError("REVIEW_REPOS is empty — set it in .env")
 
-    me = config.REVIEW_LOGIN or await whoami()
+    # `gh pr review` posts as whichever account is *active*, not as whoever we
+    # searched for. If you keep more than one login — a work account and a
+    # personal one — switching them for an unrelated `git push` would otherwise
+    # file approvals under the wrong name, on someone else's repo.
+    active = await whoami()
+    me = config.REVIEW_LOGIN or active
+    if config.REVIEW_LOGIN and active != config.REVIEW_LOGIN:
+        raise ReviewError(
+            f"gh is signed in as {active!r} but REVIEW_LOGIN is {config.REVIEW_LOGIN!r}. "
+            f"Refusing to review, so nothing gets approved under the wrong account. "
+            f"Run: gh auth switch --user {config.REVIEW_LOGIN}"
+        )
+
     pending = await find_pending(config.REVIEW_REPOS, me)
     seen = _load_seen()
     outcomes: list[Outcome] = []

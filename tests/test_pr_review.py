@@ -255,3 +255,43 @@ async def test_limit_stops_the_sweep_early(monkeypatch, tmp_path):
 
 async def _sha():
     return "deadbeef"
+
+
+@pytest.mark.anyio
+async def test_a_mismatched_gh_account_is_refused(monkeypatch):
+    """`gh pr review` posts as the ACTIVE account, not the one we searched for.
+    Switching logins for an unrelated push must not file approvals as the
+    wrong person."""
+    monkeypatch.setattr(pr_review.config, "REVIEW_REPOS", ["o/r"])
+    monkeypatch.setattr(pr_review.config, "REVIEW_LOGIN", "work-account")
+
+    async def signed_in_as_someone_else():
+        return "personal-account"
+
+    async def explode(*args, **kwargs):
+        raise AssertionError("must not search or post under the wrong account")
+
+    monkeypatch.setattr(pr_review, "whoami", signed_in_as_someone_else)
+    monkeypatch.setattr(pr_review, "find_pending", explode)
+
+    with pytest.raises(ReviewError, match="personal-account"):
+        await pr_review.sweep()
+
+
+@pytest.mark.anyio
+async def test_a_matching_gh_account_proceeds(monkeypatch, tmp_path):
+    monkeypatch.setattr(pr_review.config, "REVIEW_REPOS", ["o/r"])
+    monkeypatch.setattr(pr_review.config, "REVIEW_LOGIN", "work-account")
+    monkeypatch.setattr(pr_review.config, "REVIEW_STATE_FILE", tmp_path / "reviews.json")
+
+    async def signed_in_correctly():
+        return "work-account"
+
+    async def no_prs(repos, me):
+        assert me == "work-account"
+        return []
+
+    monkeypatch.setattr(pr_review, "whoami", signed_in_correctly)
+    monkeypatch.setattr(pr_review, "find_pending", no_prs)
+
+    assert await pr_review.sweep() == []
