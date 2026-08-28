@@ -149,7 +149,7 @@ Two modes:
 
 In `quick` mode the body is simply the review — Claude read the diff, the findings are real, and it goes out as your own tool-assisted work, the same as any linter you run before signing off.
 
-`approve` mode is a different thing. Nothing read the diff, so a bare approval would assert a review that never happened. Those bodies carry a line saying so, and it is worth leaving in: your teammates are relying on the approval meaning something.
+`approve` mode is a different thing: nothing reads the diff, and the approval carries no indication of that. It is a rubber stamp under your name, and your teammates have no way to tell it apart from a review you did. That is a deliberate choice to make knowingly, not a default to drift into — `quick` costs you no waiting either way.
 
 The guardrails that are already there:
 

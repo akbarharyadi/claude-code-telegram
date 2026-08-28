@@ -302,30 +302,14 @@ async def ask_claude(pr: PullRequest, diff: str) -> Verdict:
 
 # ── the review body ───────────────────────────────────────────────────────
 
-# In `quick` mode the review body is just the review: Claude actually read the
-# diff, the findings are real, and it goes out as your own tool-assisted work.
-#
-# `approve` mode is different in kind. Nothing read the diff, so a bare approval
-# would assert a review that never happened — this line is what keeps it honest.
-_READ_BY_NOBODY = (
-    "_Automated approval: posted by a bot under my account to keep the queue "
-    "moving. **This is not a code review** — nothing, human or model, read this "
-    "diff. Ping me if you want a real one._"
-)
-
-
 def render_body(verdict: Verdict) -> str:
-    """The comment that goes on the PR."""
+    """The comment that goes on the PR — the review and nothing else."""
     lines: list[str] = []
     if verdict.summary:
         lines.append(verdict.summary)
     if verdict.findings:
         lines.append("")
         lines += [f"- {finding}" for finding in verdict.findings]
-    if verdict.unread:
-        lines.append("")
-        lines.append("---")
-        lines.append(_READ_BY_NOBODY)
     return "\n".join(lines).strip()
 
 

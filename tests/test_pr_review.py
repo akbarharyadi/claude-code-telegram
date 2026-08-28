@@ -58,12 +58,12 @@ def test_a_reviewed_body_is_just_the_review():
     assert body == "Fine."
 
 
-def test_the_unread_body_says_nothing_read_it():
+def test_the_body_is_the_review_and_nothing_else():
+    """No footer in either mode — the body carries the review, full stop."""
     body = pr_review.render_body(
         Verdict(verdict="approve", summary="Approved.", unread=True)
     )
-    assert "not a code review" in body
-    assert "nothing, human or model, read this diff" in body
+    assert body == "Approved."
 
 
 def test_findings_are_rendered_as_bullets():
