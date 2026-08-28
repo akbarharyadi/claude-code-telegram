@@ -271,11 +271,29 @@ def effective_permission_mode() -> str:
     """Empty means the CLI default, i.e. "ask" — which the hook then answers."""
     return "" if APPROVALS_ENABLED else PERMISSION_MODE
 
+# ── PR review sweeps (pr_review.py) ───────────────────────────────────────
+# Which repos to watch. Empty means the sweep refuses to run rather than
+# guessing at every repo you can see.
+REVIEW_REPOS = _ws(os.getenv("REVIEW_REPOS"))
+# The GitHub login whose review queue we drain. Empty asks `gh` who it is.
+REVIEW_LOGIN = _clean(os.getenv("REVIEW_LOGIN"))
+# "quick" — Claude reads the diff, then approves or flags.
+# "approve" — approve without reading anything. Fast, and says so on the PR.
+REVIEW_MODE = _clean(os.getenv("REVIEW_MODE")).lower() or "quick"
+REVIEW_MODEL = _clean(os.getenv("REVIEW_MODEL")) or "claude-opus-5"
+REVIEW_EFFORT = _clean(os.getenv("REVIEW_EFFORT")) or "low"
+REVIEW_SKIP_DRAFTS = _bool(os.getenv("REVIEW_SKIP_DRAFTS"), True)
+REVIEW_TIMEOUT_SECONDS = _int(os.getenv("REVIEW_TIMEOUT_SECONDS"), 600)
+REVIEW_POLL_SECONDS = _int(os.getenv("REVIEW_POLL_SECONDS"), 900)
+# 0 keeps the sweep manual (/reviews); anything else also runs it on the timer.
+REVIEW_WATCH = _bool(os.getenv("REVIEW_WATCH"), False)
+
 # ── Local state ───────────────────────────────────────────────────────────
 STATE_DIR = Path(_clean(os.getenv("STATE_DIR")) or (ROOT / "state"))
 DOWNLOAD_DIR = STATE_DIR / "downloads"
 SESSION_FILE = STATE_DIR / "sessions.json"
 INBOX_FILE = STATE_DIR / "inbox.jsonl"
+REVIEW_STATE_FILE = STATE_DIR / "reviews.json"
 LOG_DIR = STATE_DIR / "logs"
 
 

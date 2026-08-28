@@ -32,6 +32,7 @@ import bridge
 import chrome
 import claude_runner
 import config
+import pr_review
 import store
 import tg_format
 from claude_runner import RunSpec
@@ -55,6 +56,7 @@ _run_mcp = ""
 _seen_requests: dict[str, float] = {}
 _awaiting_text: dict[str, str] = {}  # session key -> request id awaiting a typed answer
 _watcher_task: asyncio.Task | None = None
+_review_task: asyncio.Task | None = None
 
 
 # ── access control ────────────────────────────────────────────────────────
@@ -591,6 +593,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/stop — cancel the current run\n"
         "/cd &lt;name&gt; — switch repo\n"
         "/model &lt;name|clear&gt; — override the model\n"
+        "/reviews [dry|force|quick|approve] — review the PRs waiting on you\n"
         "/whoami — your ids\n\n"
         f"<b>Repo</b> <code>{html.escape(session.cwd)}</code>\n"
         f"<b>Available</b> {html.escape(choices)}",
@@ -724,6 +727,42 @@ async def cmd_chrome(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     )
 
 
+async def cmd_reviews(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Drain the PR review queue. `/reviews dry` decides but posts nothing."""
+    if not is_authorized(update):
+        return
+
+    args = [a.lower() for a in (context.args or [])]
+    dry_run = "dry" in args
+    force = "force" in args
+    mode = next((a for a in args if a in ("quick", "approve")), "")
+
+    if not config.REVIEW_REPOS:
+        await update.effective_message.reply_text(
+            "No repos configured. Set <code>REVIEW_REPOS</code> in .env, e.g.\n"
+            "<code>REVIEW_REPOS=owner/repo-one owner/repo-two</code>",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    effective = mode or config.REVIEW_MODE
+    note = "reading each diff" if effective == "quick" else "approving without reading"
+    message = await update.effective_message.reply_text(
+        f"🔎 Sweeping {len(config.REVIEW_REPOS)} repo(s), {note}…"
+        + (" (dry run)" if dry_run else ""),
+    )
+
+    try:
+        outcomes = await pr_review.sweep(mode=mode, dry_run=dry_run, force=force)
+    except pr_review.ReviewError as exc:
+        await message.edit_text(f"⚠️ {exc}")
+        return
+
+    with contextlib.suppress(TelegramError):
+        await message.delete()
+    await send_markdown(update, pr_review.summarize(outcomes, dry_run=dry_run))
+
+
 async def cmd_whoami(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
     chat = update.effective_chat
@@ -832,6 +871,7 @@ async def post_init(app: Application) -> None:
             BotCommand("cd", "Switch repository"),
             BotCommand("model", "Override the model"),
             BotCommand("chrome", "Open or check the browser"),
+            BotCommand("reviews", "Review the PRs waiting on you"),
             BotCommand("whoami", "Show your Telegram ids"),
             BotCommand("help", "Show help"),
         ]
@@ -842,8 +882,23 @@ async def post_init(app: Application) -> None:
     # Plain asyncio, not Application.create_task: post_init runs before the
     # application is started, and PTB will not adopt a task created that early.
     # We own its lifetime instead and cancel it in post_stop.
-    global _watcher_task
+    global _watcher_task, _review_task
     _watcher_task = asyncio.create_task(approval_watcher(app))
+
+    if config.REVIEW_WATCH and config.REVIEW_REPOS and config.DEFAULT_CHAT_ID:
+
+        async def report(text: str) -> None:
+            for chunk in tg_format.to_html_chunks(text):
+                with contextlib.suppress(TelegramError):
+                    await app.bot.send_message(
+                        chat_id=config.DEFAULT_CHAT_ID,
+                        text=chunk,
+                        parse_mode=ParseMode.HTML,
+                        disable_web_page_preview=True,
+                    )
+
+        _review_task = asyncio.create_task(pr_review.watch(report))
+        log.info("review sweep every %ss in %s", config.REVIEW_POLL_SECONDS, config.REVIEW_REPOS)
 
 
 def deny_pending() -> int:
@@ -863,12 +918,14 @@ def deny_pending() -> int:
 
 
 async def post_stop(app: Application) -> None:
-    global _watcher_task
-    if _watcher_task is not None and not _watcher_task.done():
-        _watcher_task.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await _watcher_task
+    global _watcher_task, _review_task
+    for task in (_watcher_task, _review_task):
+        if task is not None and not task.done():
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
     _watcher_task = None
+    _review_task = None
     deny_pending()
 
 
@@ -940,6 +997,7 @@ def main() -> None:
     app.add_handler(CommandHandler("cd", cmd_cd))
     app.add_handler(CommandHandler("model", cmd_model))
     app.add_handler(CommandHandler("chrome", cmd_chrome))
+    app.add_handler(CommandHandler("reviews", cmd_reviews))
     app.add_handler(CommandHandler("whoami", cmd_whoami))
     app.add_handler(CallbackQueryHandler(on_callback))
     app.add_handler(MessageHandler(filters.PHOTO | filters.Document.ALL, on_attachment))
