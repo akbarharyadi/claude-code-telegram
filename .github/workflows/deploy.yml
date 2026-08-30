@@ -1,0 +1,59 @@
+name: Deploy
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+concurrency:
+  group: deploy
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: [self-hosted, home-server]
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Quality gate
+        run: |
+          export PATH="$HOME/.local/bin:$PATH"
+          uv sync --group dev
+          uv run ruff check .
+          uv run pytest -q
+
+      - name: Deploy code
+        run: |
+          APP=/home/haryadi/apps/claude-code-telegram
+          mkdir -p "$APP"
+          rsync -a --delete \
+            --exclude .env \
+            --exclude state/ \
+            --exclude .git \
+            --exclude .venv \
+            --exclude '__pycache__/' \
+            --exclude '.pytest_cache/' \
+            --exclude '.ruff_cache/' \
+            ./ "$APP/"
+          cd "$APP"
+          export PATH="$HOME/.local/bin:$PATH"
+          uv sync
+
+      - name: Restart service
+        run: |
+          sudo /usr/bin/systemctl restart cctg.service
+          sleep 8
+          sudo /usr/bin/systemctl status cctg.service --no-pager | head -12
+
+      - name: Verify
+        if: success()
+        run: |
+          sleep 4
+          if journalctl -u cctg.service -n 20 --no-pager | grep -q "connected as"; then
+            echo "Bot reconnected to Telegram."
+          else
+            echo "::warning::No 'connected as' line yet - check journalctl -u cctg.service"
+            journalctl -u cctg.service -n 20 --no-pager
+          fi
