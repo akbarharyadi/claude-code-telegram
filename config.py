@@ -97,6 +97,24 @@ DISALLOWED_TOOLS = _csv(os.getenv("CLAUDE_DISALLOWED_TOOLS"))
 MAX_BUDGET_USD = _float(os.getenv("CLAUDE_MAX_BUDGET_USD"), 0.0)
 RUN_TIMEOUT_SECONDS = _int(os.getenv("CLAUDE_RUN_TIMEOUT_SECONDS"), 1800)
 
+# ── Agent backend ─────────────────────────────────────────────────────────
+# "claude"  — the Claude Code CLI (the original backend)
+# "opencode" — OpenCode 2 (`opencode2`), e.g. to run GLM via a Z.AI coding plan
+AGENT_BACKEND = _clean(os.getenv("AGENT_BACKEND")).lower() or "claude"
+if AGENT_BACKEND not in {"claude", "opencode"}:
+    AGENT_BACKEND = "claude"
+OPENCODE_BIN = (
+    _clean(os.getenv("OPENCODE_BIN"))
+    or shutil.which("opencode2")
+    or shutil.which("opencode")
+    or "opencode2"
+)
+# Local port for the opencode2 server the bot keeps running.
+OPENCODE_PORT = _int(os.getenv("OPENCODE_PORT"), 42777)
+# Default model, as provider/model. The opencode2 server otherwise picks its
+# own free gateway model, not your GLM plan — so default to GLM explicitly.
+OPENCODE_MODEL = _clean(os.getenv("OPENCODE_MODEL")) or "zai-coding-plan/glm-5.3"
+
 # ── Human-in-the-loop approvals ───────────────────────────────────────────
 # When on, dangerous tools are NOT auto-approved: a PreToolUse hook asks you on
 # Telegram and waits. Claude can also ask you questions through the ask-server.
@@ -271,11 +289,32 @@ def effective_permission_mode() -> str:
     """Empty means the CLI default, i.e. "ask" — which the hook then answers."""
     return "" if APPROVALS_ENABLED else PERMISSION_MODE
 
+# ── PR review sweeps (pr_review.py) ───────────────────────────────────────
+# Which repos to watch. Empty means the sweep refuses to run rather than
+# guessing at every repo you can see.
+REVIEW_REPOS = _ws(os.getenv("REVIEW_REPOS"))
+# The GitHub login whose review queue we drain. Empty asks `gh` who it is.
+REVIEW_LOGIN = _clean(os.getenv("REVIEW_LOGIN"))
+# "quick" — Claude reads the diff, then approves or flags.
+# "approve" — approve without reading anything. Fast, and says so on the PR.
+REVIEW_MODE = _clean(os.getenv("REVIEW_MODE")).lower() or "quick"
+REVIEW_MODEL = (
+    _clean(os.getenv("REVIEW_MODEL"))
+    or ("" if AGENT_BACKEND == "opencode" else "claude-opus-5")
+)
+REVIEW_EFFORT = _clean(os.getenv("REVIEW_EFFORT")) or "low"
+REVIEW_SKIP_DRAFTS = _bool(os.getenv("REVIEW_SKIP_DRAFTS"), True)
+REVIEW_TIMEOUT_SECONDS = _int(os.getenv("REVIEW_TIMEOUT_SECONDS"), 600)
+REVIEW_POLL_SECONDS = _int(os.getenv("REVIEW_POLL_SECONDS"), 900)
+# 0 keeps the sweep manual (/reviews); anything else also runs it on the timer.
+REVIEW_WATCH = _bool(os.getenv("REVIEW_WATCH"), False)
+
 # ── Local state ───────────────────────────────────────────────────────────
 STATE_DIR = Path(_clean(os.getenv("STATE_DIR")) or (ROOT / "state"))
 DOWNLOAD_DIR = STATE_DIR / "downloads"
 SESSION_FILE = STATE_DIR / "sessions.json"
 INBOX_FILE = STATE_DIR / "inbox.jsonl"
+REVIEW_STATE_FILE = STATE_DIR / "reviews.json"
 LOG_DIR = STATE_DIR / "logs"
 
 

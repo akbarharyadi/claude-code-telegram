@@ -13,6 +13,23 @@ It bridges both directions:
      "build finished"  ·  a screenshot  ·  "approve this?" and waits for you
 ```
 
+## Using OpenCode 2 (GLM) instead of Claude Code
+
+Set `AGENT_BACKEND=opencode` in `.env` and the same bot runs [OpenCode 2](https://opencode.ai) — `opencode2` — with any model it can reach, e.g. GLM from a Z.AI coding plan:
+
+```env
+AGENT_BACKEND=opencode
+OPENCODE_MODEL=zai-coding-plan/glm-5.3
+```
+
+Everything else works the same: threads, screenshots, live tool-by-tool progress, `/new`, `/model`, `/stop`, and the Telegram approval buttons (opencode2's permission asks and question forms are bridged over the same file queue as the Claude Code hook — timeout is still a deny). Notes:
+
+- The bot keeps one `opencode2 serve` process on `OPENCODE_PORT` (default 42777) and talks to it over its local API. Credentials live in `state/opencode-server.json`.
+- A declined approval ends that turn (opencode2 aborts the run); the session stays usable for the next message.
+- `/model` takes `provider/model`, e.g. `/model zai-coding-plan/glm-5.3-highspeed`.
+- Claude-in-Chrome tools and `CLAUDE_MAX_BUDGET_USD` don't apply to this backend.
+- PR review runs as a locked-down agent with shell/edit tools removed entirely.
+
 - **`bot.py`** — a Telegram bot that runs Claude Code for you. Threads, screenshots, albums, live tool-by-tool progress, `/stop` to cancel.
 - **`mcp_server.py`** — an MCP server so a Claude Code session on your desktop can message you, send you an image or a file, or *ask you a question and wait for the answer*.
 
@@ -121,9 +138,52 @@ python -m venv .venv
 | `/stop` | Cancel the running job. |
 | `/cd <name>` | Switch repository (from `CLAUDE_EXTRA_WORKDIRS`). Starts a new session. |
 | `/model <name>` | Override the model for this chat, e.g. `/model opus`. `/model clear` resets. |
+| `/reviews` | Review the PRs waiting on you. `dry` decides but posts nothing; `force` re-reviews PRs already done. |
 | `/whoami` | Your user id and chat id. |
 
 Each chat keeps its own session. In a forum-style group, each topic gets its own session too. Sessions survive a bot restart.
+
+---
+
+## Reviewing the PRs waiting on you
+
+`/reviews` asks GitHub which open PRs list you as a requested reviewer, shows each diff to Claude, and files the review **under your own GitHub account** through the `gh` CLI. Set `REVIEW_WATCH=1` and it also runs on a timer, reporting to `TELEGRAM_DEFAULT_CHAT_ID`.
+
+```
+REVIEW_REPOS=octocorp/api octocorp/web    # required — empty means it refuses to run
+REVIEW_MODE=quick                          # quick | approve
+REVIEW_WATCH=1                             # also sweep every REVIEW_POLL_SECONDS
+```
+
+Two modes:
+
+- **`quick`** *(default)* — Claude reads the diff and approves, requests changes, or comments. Roughly a minute and a few cents per PR.
+- **`approve`** — approves without reading anything. Fast, and honest about it: the review body says outright that nothing read the diff.
+
+### Know what you are automating
+
+`gh pr review --approve` is not a comment. It is **your** approval: it satisfies CODEOWNERS, it can unblock branch protection, and to everyone else on the PR it looks exactly like you read the code and signed off.
+
+In `quick` mode the body is simply the review — Claude read the diff, the findings are real, and it goes out as your own tool-assisted work, the same as any linter you run before signing off.
+
+`approve` mode is a different thing: nothing reads the diff, and the approval carries no indication of that. It is a rubber stamp under your name, and your teammates have no way to tell it apart from a review you did. That is a deliberate choice to make knowingly, not a default to drift into — `quick` costs you no waiting either way.
+
+The guardrails that are already there:
+
+- Whoever `gh auth status` says you are is who approves. Set `REVIEW_LOGIN` to the account you mean and the sweep refuses to run unless `gh` is actually signed in as them — otherwise switching accounts for an unrelated `git push` would file approvals under the wrong name.
+- PRs you authored are skipped; GitHub rejects a self-review anyway.
+- Drafts are skipped (`REVIEW_SKIP_DRAFTS=0` to include them).
+- A PR is reviewed once per head commit, so a re-run costs nothing until someone pushes.
+- A diff too big to read is never approved — over GitHub's 20,000-line API cap, or past `MAX_DIFF_CHARS` (1.5M, about 380k tokens), it downgrades to a comment saying a person needs to look. Keep that limit generous: set it too low and Claude sees half a diff, correctly reports it cannot verify the change, and you get a useless comment instead of a verdict.
+- Claude never gets the credential. It returns a verdict; a separate function runs `gh`. A diff that tries to talk the reviewer into something cannot reach the command line.
+
+Start with a dry run. With `REVIEW_WATCH=1` the bot sweeps the moment it starts, so do this from the terminal *before* starting it — it posts nothing:
+
+```bash
+uv run pr_review.py --dry
+```
+
+`/reviews dry` does the same from Telegram once the bot is up.
 
 ---
 

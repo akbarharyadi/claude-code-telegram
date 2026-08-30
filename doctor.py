@@ -16,10 +16,10 @@ from pathlib import Path
 
 import httpx
 
+import agent_runner
 import bridge
-import claude_runner
 import config
-from claude_runner import RunSpec
+from agent_runner import RunSpec
 
 OK = "  ok   "
 WARN = " warn  "
@@ -105,7 +105,7 @@ async def check_claude_run(report: Report) -> None:
     result = ""
     error = ""
     try:
-        async for event in claude_runner.stream_run(spec):
+        async for event in agent_runner.stream_run(spec):
             if event.session_id:
                 session_id = event.session_id
             if event.kind == "result":
@@ -169,7 +169,7 @@ async def _gate_probe(decision: dict, probe: Path) -> tuple[bool, list[dict], st
     responder = asyncio.create_task(_auto_respond(run_id, decision, seen))
     error = ""
     try:
-        async for event in claude_runner.stream_run(spec):
+        async for event in agent_runner.stream_run(spec):
             if event.kind == "error":
                 error = event.text
     except Exception as exc:  # noqa: BLE001
