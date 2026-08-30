@@ -378,6 +378,12 @@ async def test_limit_stops_the_sweep_early(monkeypatch, tmp_path):
     monkeypatch.setattr(pr_review.config, "REVIEW_REPOS", ["o/r"])
     monkeypatch.setattr(pr_review.config, "REVIEW_STATE_FILE", tmp_path / "reviews.json")
 
+    async def fake_whoami():
+        return "test-user"
+
+    monkeypatch.setattr(pr_review, "whoami", fake_whoami)
+    monkeypatch.setattr(pr_review.config, "REVIEW_LOGIN", "test-user")
+
     async def fake_pending(repos, me):
         return [
             PullRequest(repo="o/r", number=n, title="t", author="someone", url="u")
