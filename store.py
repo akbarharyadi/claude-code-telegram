@@ -31,6 +31,7 @@ class Session:
     turns: int = 0
     cost_usd: float = 0.0
     updated_at: float = 0.0
+    backend: str = ""  # which agent runner the session id belongs to
 
 
 def _read_json(path: Path, fallback):

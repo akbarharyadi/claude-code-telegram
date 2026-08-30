@@ -6,6 +6,7 @@ when only part of the diff was read."""
 
 from __future__ import annotations
 
+import json
 import sys
 from pathlib import Path
 
@@ -50,6 +51,126 @@ def test_unparseable_replies_raise_rather_than_approve(reply):
 def test_non_list_findings_are_coerced():
     verdict = pr_review._extract_verdict('{"verdict": "comment", "findings": "just one"}')
     assert verdict.findings == ["just one"]
+
+
+def test_extracts_inline_comments_and_skips_broken_ones():
+    """Line comments ride along; rows we cannot read are dropped, not fatal."""
+    verdict = pr_review._extract_verdict(
+        '{"verdict": "approve", "summary": "s", "findings": [], "comments": ['
+        '{"path": "a/x.py", "line": "12", "body": "checked bounds"}, '
+        '{"path": "y.py"}, '
+        '{"path": "z.py", "line": "nope", "body": "b"}, '
+        '"junk"]}'
+    )
+    assert [(c.path, c.line, c.body) for c in verdict.comments] == [
+        ("a/x.py", 12, "checked bounds")
+    ]
+
+
+_SAMPLE_DIFF = "\n".join(
+    [
+        "diff --git a/app.py b/app.py",
+        "index 1111111..2222222 100644",
+        "--- a/app.py",
+        "+++ b/app.py",
+        "@@ -1,3 +1,4 @@",
+        " context",
+        "-removed",
+        "+added",
+        "+another",
+        " tail",
+        "@@ -10,3 +10,1 @@",
+        " ctx",
+        "-del one",
+        "-del two",
+        "diff --git a/lib/old.py b/lib/new.py",
+        "similarity index 90%",
+        "rename from lib/old.py",
+        "rename to lib/new.py",
+        "@@ -5 +5 @@",
+        "-before",
+        "+after",
+    ]
+)
+
+
+def test_diff_anchors_track_both_sides():
+    anchors = pr_review.diff_anchors(_SAMPLE_DIFF)
+    assert anchors["app.py"]["RIGHT"] == {1, 2, 3, 4, 10}
+    assert anchors["app.py"]["LEFT"] == {1, 2, 3, 10, 11, 12}
+    assert anchors["lib/new.py"]["RIGHT"] == {5}
+    assert anchors["lib/new.py"]["LEFT"] == {5}
+
+
+def test_diff_anchors_survive_header_lookalikes():
+    """A deleted line whose text starts with `--` must not parse as a header."""
+    diff = "\n".join(
+        [
+            "diff --git a/flags.py b/flags.py",
+            "--- a/flags.py",
+            "+++ b/flags.py",
+            "@@ -1,2 +1,2 @@",
+            "---verbose",  # deleting the line "--verbose"
+            "+--quiet",
+        ]
+    )
+    anchors = pr_review.diff_anchors(diff)
+    assert anchors["flags.py"]["LEFT"] == {1}
+    assert anchors["flags.py"]["RIGHT"] == {1}
+
+
+def test_inline_comments_that_cannot_anchor_are_dropped():
+    """One invented path or line voids a whole review on GitHub, so bad
+    anchors are dropped here instead of posted."""
+    kept = pr_review.fit_comments(
+        [
+            pr_review.LineComment(path="app.py", line=2, body="on the addition"),
+            pr_review.LineComment(path="b/app.py", line=4, body="prefix stripped"),
+            pr_review.LineComment(path="app.py", line=3, body="prefers the new side"),
+            pr_review.LineComment(path="app.py", line=11, body="a deleted line, old side"),
+            pr_review.LineComment(path="ghost.py", line=1, body="invented file"),
+            pr_review.LineComment(path="app.py", line=99, body="invented line"),
+            pr_review.LineComment(path="app.py", line=2, body="duplicate anchor"),
+            pr_review.LineComment(path="app.py", line=1, body=""),
+        ],
+        _SAMPLE_DIFF,
+    )
+    assert [(c.path, c.line, c.side, c.body) for c in kept] == [
+        ("app.py", 2, "RIGHT", "on the addition"),
+        ("app.py", 4, "RIGHT", "prefix stripped"),
+        ("app.py", 3, "RIGHT", "prefers the new side"),
+        ("app.py", 11, "LEFT", "a deleted line, old side"),
+    ]
+
+
+@pytest.mark.anyio
+async def test_submit_review_posts_inline_comments_via_the_api(monkeypatch):
+    """Only the reviews endpoint takes per-line comments, so `gh pr review`
+    is out; the payload rides to `gh api` on stdin."""
+    calls: list[tuple[tuple[str, ...], str | None]] = []
+
+    async def fake_gh(*args, check=True, stdin_data=None):
+        calls.append((args, stdin_data))
+        return ""
+
+    monkeypatch.setattr(pr_review, "_gh", fake_gh)
+    pr = PullRequest(repo="o/r", number=5, title="t", author="a", url="u", head_sha="cafe")
+    verdict = Verdict(
+        verdict="approve",
+        summary="ok",
+        comments=[pr_review.LineComment(path="app.py", line=2, body="checked")],
+    )
+
+    await pr_review.submit_review(pr, verdict)
+
+    args, stdin = calls[0]
+    assert "repos/o/r/pulls/5/reviews" in args
+    payload = json.loads(stdin or "")
+    assert payload["event"] == "APPROVE"
+    assert payload["commit_id"] == "cafe"
+    assert payload["comments"] == [
+        {"path": "app.py", "line": 2, "side": "RIGHT", "body": "checked"}
+    ]
 
 
 def test_a_reviewed_body_is_just_the_review():
@@ -295,3 +416,106 @@ async def test_a_matching_gh_account_proceeds(monkeypatch, tmp_path):
     monkeypatch.setattr(pr_review, "find_pending", no_prs)
 
     assert await pr_review.sweep() == []
+
+
+@pytest.mark.anyio
+async def test_an_approval_posts_no_inline_comments(monkeypatch):
+    """Inline notes are for defects only — verification receipts on a clean
+    approval just spam every hunk of the diff."""
+
+    async def approving(pr, diff):
+        return Verdict(
+            verdict="approve",
+            summary="clean",
+            comments=[pr_review.LineComment(path="x.py", line=1, body="receipt")],
+        )
+
+    monkeypatch.setattr(pr_review, "fetch_diff", _tiny_diff)
+    monkeypatch.setattr(pr_review, "ask_claude", approving)
+    pr = PullRequest(repo="o/r", number=9, title="t", author="someone", url="u")
+
+    outcome = await pr_review.review_one(pr, mode="quick", dry_run=True)
+
+    assert outcome.verdict is not None
+    assert outcome.verdict.verdict == "approve"
+    assert outcome.verdict.comments == []
+
+
+@pytest.mark.anyio
+async def test_requested_changes_keep_their_inline_comments(monkeypatch):
+    async def defect(pr, diff):
+        return Verdict(
+            verdict="request_changes",
+            summary="one defect",
+            comments=[pr_review.LineComment(path="x.py", line=1, body="what breaks")],
+        )
+
+    monkeypatch.setattr(pr_review, "fetch_diff", _tiny_diff)
+    monkeypatch.setattr(pr_review, "ask_claude", defect)
+    pr = PullRequest(repo="o/r", number=9, title="t", author="someone", url="u")
+
+    outcome = await pr_review.review_one(pr, mode="quick", dry_run=True)
+
+    assert outcome.verdict is not None
+    assert [(c.path, c.line, c.body) for c in outcome.verdict.comments] == [
+        ("x.py", 1, "what breaks")
+    ]
+
+
+@pytest.mark.anyio
+async def test_review_now_reviews_a_pr_nobody_is_waiting_on(monkeypatch, tmp_path):
+    """/review is the on-demand path: it must not care that the PR was already
+    handled, and it must record the head so the sweep skips it after."""
+    monkeypatch.setattr(pr_review.config, "REVIEW_REPOS", ["o/r"])
+    monkeypatch.setattr(pr_review.config, "REVIEW_LOGIN", "")  # trust the active gh login
+    monkeypatch.setattr(pr_review.config, "REVIEW_STATE_FILE", tmp_path / "reviews.json")
+
+    async def fake_gh(*args, check=True, stdin_data=None):
+        if args[:2] == ("pr", "view"):
+            return (
+                '{"number": 7, "title": "the pr", "author": {"login": "someone"},'
+                ' "isDraft": false, "url": "u", "headRefOid": "cafe"}'
+            )
+        return "work-account"  # whoami
+
+    monkeypatch.setattr(pr_review, "_gh", fake_gh)
+    monkeypatch.setattr(pr_review, "fetch_diff", _tiny_diff)
+    monkeypatch.setattr(pr_review, "ask_claude", _ok_verdict)
+
+    posted: list[int] = []
+
+    async def fake_submit(pr, verdict):
+        posted.append(pr.number)
+
+    monkeypatch.setattr(pr_review, "submit_review", fake_submit)
+
+    outcome = await pr_review.review_now("o/r", 7)
+
+    assert outcome.posted is True
+    assert outcome.verdict is not None and outcome.verdict.verdict == "approve"
+    assert posted == [7]
+    state = json.loads((tmp_path / "reviews.json").read_text(encoding="utf-8"))
+    assert state == {"o/r#7": "cafe"}
+
+
+async def _tiny_diff(pr):
+    return "diff --git a/x.py b/x.py\n+++ b/x.py\n@@ -1 +1 @@\n-ok\n+fine\n"
+
+
+async def _ok_verdict(pr, diff):
+    return Verdict(verdict="approve", summary="ok")
+
+
+@pytest.mark.anyio
+async def test_review_now_refuses_a_mismatched_account(monkeypatch, tmp_path):
+    monkeypatch.setattr(pr_review.config, "REVIEW_REPOS", ["o/r"])
+    monkeypatch.setattr(pr_review.config, "REVIEW_LOGIN", "work-account")
+    monkeypatch.setattr(pr_review.config, "REVIEW_STATE_FILE", tmp_path / "reviews.json")
+
+    async def signed_in_as_someone_else():
+        return "personal-account"
+
+    monkeypatch.setattr(pr_review, "whoami", signed_in_as_someone_else)
+
+    with pytest.raises(ReviewError, match="personal-account"):
+        await pr_review.review_now("o/r", 7)

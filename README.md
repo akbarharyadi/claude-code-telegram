@@ -13,6 +13,23 @@ It bridges both directions:
      "build finished"  ·  a screenshot  ·  "approve this?" and waits for you
 ```
 
+## Using OpenCode 2 (GLM) instead of Claude Code
+
+Set `AGENT_BACKEND=opencode` in `.env` and the same bot runs [OpenCode 2](https://opencode.ai) — `opencode2` — with any model it can reach, e.g. GLM from a Z.AI coding plan:
+
+```env
+AGENT_BACKEND=opencode
+OPENCODE_MODEL=zai-coding-plan/glm-5.3
+```
+
+Everything else works the same: threads, screenshots, live tool-by-tool progress, `/new`, `/model`, `/stop`, and the Telegram approval buttons (opencode2's permission asks and question forms are bridged over the same file queue as the Claude Code hook — timeout is still a deny). Notes:
+
+- The bot keeps one `opencode2 serve` process on `OPENCODE_PORT` (default 42777) and talks to it over its local API. Credentials live in `state/opencode-server.json`.
+- A declined approval ends that turn (opencode2 aborts the run); the session stays usable for the next message.
+- `/model` takes `provider/model`, e.g. `/model zai-coding-plan/glm-5.3-highspeed`.
+- Claude-in-Chrome tools and `CLAUDE_MAX_BUDGET_USD` don't apply to this backend.
+- PR review runs as a locked-down agent with shell/edit tools removed entirely.
+
 - **`bot.py`** — a Telegram bot that runs Claude Code for you. Threads, screenshots, albums, live tool-by-tool progress, `/stop` to cancel.
 - **`mcp_server.py`** — an MCP server so a Claude Code session on your desktop can message you, send you an image or a file, or *ask you a question and wait for the answer*.
 

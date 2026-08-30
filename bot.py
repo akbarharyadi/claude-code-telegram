@@ -12,6 +12,7 @@ import asyncio
 import contextlib
 import html
 import logging
+import re
 import time
 import uuid
 from pathlib import Path
@@ -28,14 +29,14 @@ from telegram.ext import (
     filters,
 )
 
+import agent_runner
 import bridge
 import chrome
-import claude_runner
 import config
 import pr_review
 import store
 import tg_format
-from claude_runner import RunSpec
+from agent_runner import RunSpec
 
 log = logging.getLogger("claude-telegram")
 
@@ -84,14 +85,26 @@ def session_key(update: Update) -> str:
     return f"{chat.id}:{thread or 0}"
 
 
+def _fresh_session(cwd: str, add_dirs: list[str], model: str) -> store.Session:
+    """Claude Code lets the bot pin the session id up front; OpenCode mints its
+    own (`ses_…`) when the server creates the session, so start empty there."""
+    session_id = "" if config.AGENT_BACKEND == "opencode" else str(uuid.uuid4())
+    return store.Session(
+        session_id=session_id,
+        cwd=cwd,
+        add_dirs=add_dirs,
+        model=model,
+        backend=config.AGENT_BACKEND,
+    )
+
+
 def get_session(key: str) -> store.Session:
     session = _sessions.get(key)
     if session is None:
-        session = store.Session(
-            session_id=str(uuid.uuid4()),
-            cwd=config.CLAUDE_WORKDIR,
-            add_dirs=list(config.CLAUDE_ADD_DIRS),
-            model=config.CLAUDE_MODEL,
+        session = _fresh_session(
+            config.CLAUDE_WORKDIR,
+            list(config.CLAUDE_ADD_DIRS),
+            config.CLAUDE_MODEL,
         )
         _sessions[key] = session
         store.save_sessions(_sessions)
@@ -100,11 +113,10 @@ def get_session(key: str) -> store.Session:
 
 def reset_session(key: str) -> store.Session:
     previous = _sessions.get(key)
-    session = store.Session(
-        session_id=str(uuid.uuid4()),
-        cwd=previous.cwd if previous else config.CLAUDE_WORKDIR,
-        add_dirs=list(previous.add_dirs) if previous else list(config.CLAUDE_ADD_DIRS),
-        model=previous.model if previous else config.CLAUDE_MODEL,
+    session = _fresh_session(
+        previous.cwd if previous else config.CLAUDE_WORKDIR,
+        list(previous.add_dirs) if previous else list(config.CLAUDE_ADD_DIRS),
+        previous.model if previous else config.CLAUDE_MODEL,
     )
     _sessions[key] = session
     store.save_sessions(_sessions)
@@ -206,8 +218,11 @@ async def run_job(update: Update, context: ContextTypes.DEFAULT_TYPE, prompt: st
         return
 
     session = get_session(key)
+    if session.backend != config.AGENT_BACKEND:
+        # A session id from the other backend means nothing to this one.
+        session = reset_session(key)
     add_dirs = [*session.add_dirs, str(config.DOWNLOAD_DIR)]
-    target = claude_runner.describe_target(session.cwd, session.add_dirs)
+    target = agent_runner.describe_target(session.cwd, session.add_dirs)
     header = f"🤖 <b>{html.escape(target)}</b>"
 
     placeholder = await message.reply_text(f"{header}\n<i>thinking…</i>", parse_mode=ParseMode.HTML)
@@ -249,7 +264,7 @@ async def run_job(update: Update, context: ContextTypes.DEFAULT_TYPE, prompt: st
         typing_at = 0.0
 
         try:
-            async for event in claude_runner.stream_run(spec):
+            async for event in agent_runner.stream_run(spec):
                 now = time.monotonic()
                 if now - typing_at > 4:
                     typing_at = now
@@ -594,6 +609,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/cd &lt;name&gt; — switch repo\n"
         "/model &lt;name|clear&gt; — override the model\n"
         "/reviews [dry|force|quick|approve] — review the PRs waiting on you\n"
+        "/review &lt;owner/repo&gt;#&lt;n&gt; — re-review one PR now, no questions asked\n"
         "/whoami — your ids\n\n"
         f"<b>Repo</b> <code>{html.escape(session.cwd)}</code>\n"
         f"<b>Available</b> {html.escape(choices)}",
@@ -629,6 +645,7 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     await update.effective_message.reply_text(
         f"<b>Running</b> {running}\n"
         f"<b>Approvals</b> {html.escape(gate)}\n"
+        f"<b>Backend</b> {html.escape(config.AGENT_BACKEND)}\n"
         f"<b>Repo</b> <code>{html.escape(session.cwd)}</code>\n"
         f"<b>Model</b> {html.escape(session.model or 'default')}\n"
         f"<b>Turns</b> {session.turns} · <b>Spent</b> ${session.cost_usd:.3f}\n"
@@ -763,6 +780,84 @@ async def cmd_reviews(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     await send_markdown(update, pr_review.summarize(outcomes, dry_run=dry_run))
 
 
+_REVIEW_TARGET = re.compile(r"(?:(?P<repo>[\w.-]+/[\w.-]+)[#\s]+)?#?(?P<number>\d+)$")
+
+# Plain text that is really a review wish: "re review o/r#123", "review #2307 dry".
+# Narrow on purpose — the message must be nothing but the wish plus optional
+# flags; anything chattier ("review the auth flow please") still goes to the
+# agent.
+_REVIEW_MSG = re.compile(
+    r"^(?:please\s+|pls\s+)?(?:re[\s-]?)?review\s+(?P<rest>.+)$", re.I | re.S
+)
+
+
+def _parse_review_target(rest: str) -> tuple[str, int, str, bool] | None:
+    """'owner/repo#123 [dry|quick|approve]' in any spacing — None if it is not one."""
+    words = rest.split()
+    dry_run = any(w.lower() == "dry" for w in words)
+    mode = next((w.lower() for w in words if w.lower() in ("quick", "approve")), "")
+    target = " ".join(w for w in words if w.lower() not in ("dry", "quick", "approve"))
+    m = _REVIEW_TARGET.fullmatch(target)
+    if not m or not m.group("number"):
+        return None
+    return m.group("repo") or "", int(m.group("number")), mode, dry_run
+
+
+async def _resolve_review_repo(update: Update, repo: str, number: int) -> str:
+    """Fill in the repo when the message named only a PR number."""
+    if repo:
+        return repo
+    if len(config.REVIEW_REPOS) == 1:
+        return config.REVIEW_REPOS[0]
+    await update.effective_message.reply_text(
+        f"Which repo? REVIEW_REPOS lists {len(config.REVIEW_REPOS)}. "
+        f"Use <code>/review owner/repo#{number}</code>.",
+        parse_mode=ParseMode.HTML,
+    )
+    return ""
+
+
+async def _run_single_review(
+    update: Update, repo: str, number: int, mode: str, dry_run: bool
+) -> None:
+    message = await update.effective_message.reply_text(
+        f"🔎 Reviewing <code>{html.escape(repo)}#{number}</code>…",
+        parse_mode=ParseMode.HTML,
+    )
+    try:
+        outcome = await pr_review.review_now(repo, number, mode=mode, dry_run=dry_run)
+    except pr_review.ReviewError as exc:
+        await message.edit_text(f"⚠️ {html.escape(str(exc))}")
+        return
+
+    with contextlib.suppress(TelegramError):
+        await message.delete()
+    await send_markdown(update, pr_review.summarize([outcome], dry_run=dry_run))
+
+
+async def cmd_review(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Re-review one PR right now: /review owner/repo#123 [dry|quick|approve].
+
+    This is the automation path — it never asks for tool approvals, unlike
+    phrasing the same wish as a plain message, which the chat agent picks up
+    and Bash-approvals all over.
+    """
+    if not is_authorized(update):
+        return
+    parsed = _parse_review_target(" ".join(context.args or []))
+    if parsed is None:
+        await update.effective_message.reply_text(
+            "Usage: <code>/review owner/repo#123</code> [dry|quick|approve]",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+    repo, number, mode, dry_run = parsed
+    repo = await _resolve_review_repo(update, repo, number)
+    if not repo:
+        return
+    await _run_single_review(update, repo, number, mode, dry_run)
+
+
 async def cmd_whoami(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
     chat = update.effective_chat
@@ -788,6 +883,19 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         bridge.respond(pending_ask, {"answer": text})
         await message.reply_text("✅ Sent to Claude.")
         return
+
+    # "re review owner/repo#123" typed as plain text is still a review command:
+    # route it to the automation instead of waking the agent for a round of
+    # Bash approvals.
+    review_wish = _REVIEW_MSG.match(text)
+    if review_wish:
+        parsed = _parse_review_target(review_wish.group("rest"))
+        if parsed:
+            repo, number, mode, dry_run = parsed
+            repo = await _resolve_review_repo(update, repo, number)
+            if repo:
+                await _run_single_review(update, repo, number, mode, dry_run)
+            return
 
     store.append_inbox(
         {
@@ -870,6 +978,7 @@ async def post_init(app: Application) -> None:
             BotCommand("stop", "Cancel the current run"),
             BotCommand("cd", "Switch repository"),
             BotCommand("model", "Override the model"),
+            BotCommand("review", "Re-review one PR now"),
             BotCommand("chrome", "Open or check the browser"),
             BotCommand("reviews", "Review the PRs waiting on you"),
             BotCommand("whoami", "Show your Telegram ids"),
@@ -927,6 +1036,7 @@ async def post_stop(app: Application) -> None:
     _watcher_task = None
     _review_task = None
     deny_pending()
+    agent_runner.shutdown()
 
 
 def main() -> None:
@@ -957,11 +1067,19 @@ def main() -> None:
     _run_settings, _run_mcp = config.write_run_configs()
 
     log.info(
-        "workdir=%s add_dirs=%s users=%s",
+        "backend=%s workdir=%s add_dirs=%s users=%s",
+        config.AGENT_BACKEND,
         config.CLAUDE_WORKDIR,
         config.CLAUDE_ADD_DIRS,
         sorted(config.ALLOWED_USER_IDS),
     )
+    if config.AGENT_BACKEND == "opencode":
+        log.info(
+            "opencode2: bin=%s port=%s model=%s",
+            config.OPENCODE_BIN,
+            config.OPENCODE_PORT,
+            config.OPENCODE_MODEL or "default",
+        )
     if config.ENABLE_CHROME:
         binary = chrome.find_binary()
         log.info(
@@ -998,6 +1116,7 @@ def main() -> None:
     app.add_handler(CommandHandler("model", cmd_model))
     app.add_handler(CommandHandler("chrome", cmd_chrome))
     app.add_handler(CommandHandler("reviews", cmd_reviews))
+    app.add_handler(CommandHandler("review", cmd_review))
     app.add_handler(CommandHandler("whoami", cmd_whoami))
     app.add_handler(CallbackQueryHandler(on_callback))
     app.add_handler(MessageHandler(filters.PHOTO | filters.Document.ALL, on_attachment))
