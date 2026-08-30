@@ -341,16 +341,19 @@ Reply with ONLY a fenced json block and nothing else:
 {{"verdict": "approve", "summary": "<paragraph>", "findings": ["<bullet>", "<bullet>"], "comments": [{{"path": "<file from the diff>", "line": <line on the new side>, "body": "<note for that exact line>"}}]}}
 ```
 
-The "summary" field — a substantial paragraph (3-6 sentences, never one
-sentence). Walk through the change area by area and name the real files,
-functions, and hunks you examined. State what each part does and what you
-verified about it: the logic, inputs and bounds, error paths, and any
-invariant it must uphold. End with the bottom line — what defect classes
-(correctness, security, data loss) you hunted for and did not find.
+The "summary" field — 3-5 short sentences (under 100 words; each sentence one
+single clause, never a run-on wall of semicolons). Name the real files and
+functions you examined and the one thing you verified about each; end with the
+bottom line — what defect classes (correctness, security, data loss) you
+hunted for and did not find. The detailed record lives in "findings", not
+here.
 
 The "findings" field — concrete, self-contained bullets, at least one per
-touched file or logical theme (use backticked file/function names). These are
-not complaints; they are the evidence behind the verdict. Cover:
+touched file or logical theme. Each bullet is ONE sentence (under 30 words)
+shaped like: backticked file or function name, an em dash, then what you
+verified or flagged about it. Never chain clauses with semicolons — split
+into two bullets instead. These are not complaints; they are the evidence
+behind the verdict. Cover:
 - what each significant hunk does and why it is safe (or not),
 - the risks you traced and cleared — injection/parameterization, tenant or auth
   scoping, data loss, race conditions, off-by-one, unhandled None/empty/error
@@ -479,14 +482,36 @@ async def ask_claude(pr: PullRequest, diff: str) -> Verdict:
 
 # ── the review body ───────────────────────────────────────────────────────
 
+_VERDICT_HEADER = {
+    "approve": "✅ Approved",
+    "request_changes": "🔴 Changes requested",
+    "comment": "💬 Needs a look",
+}
+
+
 def render_body(verdict: Verdict) -> str:
-    """The comment that goes on the PR — the review and nothing else."""
-    lines: list[str] = []
+    """The comment that goes on the PR: a verdict header, a short summary, and
+    the evidence folded into a collapsible section so the diff stays readable."""
+    lines: list[str] = [f"## {_VERDICT_HEADER.get(verdict.verdict, '💬 Review')}"]
+    if verdict.unread:
+        lines += [
+            "",
+            "> [!WARNING]",
+            "> Filed without reading the diff — a rubber stamp, not a review.",
+        ]
     if verdict.summary:
-        lines.append(verdict.summary)
+        lines += ["", verdict.summary]
     if verdict.findings:
-        lines.append("")
-        lines += [f"- {finding}" for finding in verdict.findings]
+        label = "Defects found" if verdict.verdict == "request_changes" else "What was verified"
+        lines += [
+            "",
+            "<details>",
+            f"<summary>{label}</summary>",
+            "",
+            *[f"- {finding}" for finding in verdict.findings],
+            "",
+            "</details>",
+        ]
     return "\n".join(lines).strip()
 
 
@@ -645,34 +670,55 @@ async def sweep(
     return outcomes
 
 
+# Telegram is the notification, GitHub is the record — so the report shows the
+# verdict, a taste of the reasoning, and a link, and stops there.
+_SUMMARY_CHARS = 500
+_FINDING_CHARS = 180
+_MAX_FINDINGS = 3
+
+
+def _clip(text: str, limit: int) -> str:
+    """Collapse to one line and cut to `limit`, ellipsis on overflow."""
+    text = " ".join((text or "").split())
+    return text if len(text) <= limit else text[: limit - 1].rstrip() + "…"
+
+
 def summarize(outcomes: list[Outcome], *, dry_run: bool = False) -> str:
-    """A phone-sized markdown report of one sweep."""
+    """A phone-sized notification of one sweep — the full review lives on the PR."""
     if not outcomes:
         return "Nothing new is waiting on your review."
 
     icon = {"approve": "✅", "request_changes": "🔴", "comment": "💬"}
-    lines: list[str] = []
+    blocks: list[str] = []
     spent = 0.0
     for out in outcomes:
         head = f"[{out.pr.repo}#{out.pr.number}]({out.pr.url})"
         if out.error:
-            lines.append(f"⚠️ {head} — {out.error}")
+            blocks.append(f"⚠️ {head}\n{_clip(out.error, _FINDING_CHARS)}")
             continue
         verdict = out.verdict
         if verdict is None:
             continue
         spent += verdict.cost_usd
         mark = icon.get(verdict.verdict, "•")
-        suffix = "" if out.posted else " _(dry run)_"
-        lines.append(f"{mark} {head} — {verdict.summary or verdict.verdict}{suffix}")
-        lines += [f"    · {finding}" for finding in verdict.findings[:3]]
+        lines = [
+            f"{mark} {head} — **{_clip(out.pr.title, 70)}**"
+            + ("" if out.posted else " *(dry run)*")
+        ]
+        if verdict.summary:
+            lines.append(_clip(verdict.summary, _SUMMARY_CHARS))
+        for finding in verdict.findings[:_MAX_FINDINGS]:
+            lines.append(f"  • {_clip(finding, _FINDING_CHARS)}")
+        if len(verdict.findings) > _MAX_FINDINGS:
+            lines.append(f"  • …{len(verdict.findings) - _MAX_FINDINGS} more on the PR")
         if verdict.comments:
-            lines.append(f"    · {len(verdict.comments)} inline comment(s)")
+            lines.append(f"  • {len(verdict.comments)} inline comment(s)")
+        blocks.append("\n".join(lines))
 
+    text = "\n──────────\n\n".join(blocks)
     if spent:
-        lines.append("")
-        lines.append(f"_Spent ${spent:.3f}._")
-    return "\n".join(lines)
+        text += f"\n\n*Spent ${spent:.3f}.*"
+    return text
 
 
 async def watch(on_report) -> None:

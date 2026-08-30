@@ -173,26 +173,36 @@ async def test_submit_review_posts_inline_comments_via_the_api(monkeypatch):
     ]
 
 
-def test_a_reviewed_body_is_just_the_review():
-    """quick mode is your own tool-assisted work — no footer on it."""
+def test_the_body_leads_with_a_verdict_header():
     body = pr_review.render_body(Verdict(verdict="approve", summary="Fine."))
-    assert body == "Fine."
+    assert body.startswith("## ✅")
+    assert "Fine." in body
 
 
-def test_the_body_is_the_review_and_nothing_else():
-    """No footer in either mode — the body carries the review, full stop."""
+def test_an_unread_approval_carries_a_warning():
+    """approve mode files a verdict nothing read — the body must say so."""
     body = pr_review.render_body(
         Verdict(verdict="approve", summary="Approved.", unread=True)
     )
-    assert body == "Approved."
+    assert "WARNING" in body
+    assert "without reading the diff" in body.lower()
 
 
-def test_findings_are_rendered_as_bullets():
+def test_findings_are_collapsed_bullets():
+    """The evidence folds away so the review comment stays scannable."""
     body = pr_review.render_body(
         Verdict(verdict="request_changes", summary="Two problems.", findings=["a", "b"])
     )
+    assert "<details>" in body
     assert "- a" in body
     assert "- b" in body
+
+
+def test_request_changes_label_the_collapsed_section_as_defects():
+    body = pr_review.render_body(
+        Verdict(verdict="request_changes", summary="Broken.", findings=["a"])
+    )
+    assert "Defects found" in body
 
 
 @pytest.mark.anyio
@@ -307,6 +317,22 @@ def test_summarize_marks_unposted_verdicts_as_a_dry_run():
         [pr_review.Outcome(pr=pr, verdict=Verdict(verdict="approve", summary="ok"), posted=False)]
     )
     assert "dry run" in text
+
+
+def test_summarize_compacts_instead_of_pasting_the_review():
+    """Telegram gets a headline, a taste of the summary, and the first few
+    findings — the wall of text lives on the PR, not on the phone."""
+    pr = PullRequest(repo="o/r", number=7, title="big change", author="a", url="u")
+    verdict = Verdict(
+        verdict="approve",
+        summary="word " * 300,
+        findings=["finding " * 100, "b", "c", "d"],
+    )
+    text = pr_review.summarize([pr_review.Outcome(pr=pr, verdict=verdict, posted=True)])
+    assert "o/r#7" in text
+    assert "big change" in text
+    assert len(text) < 1600
+    assert "1 more on the PR" in text
 
 
 @pytest.mark.anyio
