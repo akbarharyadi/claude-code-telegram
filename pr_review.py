@@ -89,6 +89,11 @@ class Verdict:
 
 # ── talking to gh ─────────────────────────────────────────────────────────
 
+# A stalled gh call must not freeze the sweep: this hung for 75 real minutes
+# on the home server (TCP retransmit on a dead Wi-Fi hop) with nothing in the
+# logs, because communicate() waits forever without a deadline.
+GH_TIMEOUT_SECONDS = 120
+
 
 async def _gh(*args: str, check: bool = True, stdin_data: str | None = None) -> str:
     """Run `gh` and return stdout. Never takes a shell string."""
@@ -99,9 +104,19 @@ async def _gh(*args: str, check: bool = True, stdin_data: str | None = None) -> 
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
-    out, err = await proc.communicate(
-        input=stdin_data.encode("utf-8") if stdin_data is not None else None
-    )
+    try:
+        out, err = await asyncio.wait_for(
+            proc.communicate(
+                input=stdin_data.encode("utf-8") if stdin_data is not None else None
+            ),
+            timeout=GH_TIMEOUT_SECONDS,
+        )
+    except TimeoutError:
+        proc.kill()
+        await proc.wait()
+        raise ReviewError(
+            f"gh {' '.join(args[:2])} timed out after {GH_TIMEOUT_SECONDS}s"
+        ) from None
     stdout = out.decode("utf-8", "replace")
     if check and proc.returncode != 0:
         detail = err.decode("utf-8", "replace").strip() or stdout.strip()
