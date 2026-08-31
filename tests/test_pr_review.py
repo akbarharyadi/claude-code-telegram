@@ -206,22 +206,37 @@ def test_request_changes_label_the_collapsed_section_as_defects():
 
 
 @pytest.mark.anyio
-async def test_a_truncated_diff_downgrades_an_approval(monkeypatch):
-    """Approving a diff we only partly read would overstate what was checked."""
+async def test_an_oversized_diff_is_reviewed_in_parts_and_stays_decisive(monkeypatch):
+    """Chunking covers the whole diff, so a big PR can still be approved —
+    no downgrade to 'comment' just because it is big."""
+    seen_prompts: list[str] = []
 
     async def fake_stream(spec):
-        yield type("E", (), {"kind": "text", "text": '{"verdict": "approve", "summary": "ok"}'})()
+        seen_prompts.append(spec.prompt)
+        part = "1" if "1 of 2" in spec.prompt else "2"
+        yield type(
+            "E",
+            (),
+            {
+                "kind": "text",
+                "text": '{"verdict": "approve", "summary": "part ' + part + ' clean"}',
+            },
+        )()
         yield type(
             "E", (), {"kind": "result", "text": "", "cost_usd": 0.01, "is_error": False}
         )()
 
     monkeypatch.setattr(pr_review, "stream_run", fake_stream)
+    monkeypatch.setattr(pr_review, "MAX_DIFF_CHARS", 4_000)
     pr = PullRequest(repo="o/r", number=1, title="t", author="someone", url="u")
 
-    verdict = await pr_review.ask_claude(pr, "x" * (pr_review.MAX_DIFF_CHARS + 1))
+    diff = _file_patch("a.py", 150) + _file_patch("b.py", 150)
+    verdict = await pr_review.ask_claude(pr, diff)
 
-    assert verdict.verdict == "comment"
-    assert "truncated" in pr_review.render_body(verdict).lower() or "exceeds" in verdict.summary
+    assert verdict.verdict == "approve"
+    assert len(seen_prompts) == 2
+    assert "1 of 2" in seen_prompts[0] and "2 of 2" in seen_prompts[1]
+    assert "Reviewed in 2 parts" in verdict.summary
 
 
 @pytest.mark.anyio
@@ -551,3 +566,67 @@ async def test_review_now_refuses_a_mismatched_account(monkeypatch, tmp_path):
 
     with pytest.raises(ReviewError, match="personal-account"):
         await pr_review.review_now("o/r", 7)
+
+
+# ── chunked review of oversized diffs ─────────────────────────────────────
+
+
+def _file_patch(name: str, lines: int) -> str:
+    body = "".join(f"+line {i} of {name}\n" for i in range(lines))
+    return f"diff --git a/{name} b/{name}\n--- a/{name}\n+++ b/{name}\n{body}"
+
+
+def test_split_diff_keeps_one_chunk_when_it_fits():
+    diff = _file_patch("a.py", 10) + _file_patch("b.py", 10)
+    chunks = pr_review._split_diff(diff, 10_000)
+    assert len(chunks) == 1
+    assert "a.py" in chunks[0] and "b.py" in chunks[0]
+
+
+def test_split_diff_cuts_at_file_boundaries():
+    diff = _file_patch("a.py", 40) + _file_patch("b.py", 40)
+    chunks = pr_review._split_diff(diff, 1_200)
+    assert len(chunks) == 2
+    assert "a.py" in chunks[0]
+    assert "b.py" in chunks[1]
+    assert all(len(chunk) <= 1_200 for chunk in chunks)
+    assert "".join(chunks) == diff
+
+
+def test_split_diff_hard_splits_one_giant_file():
+    diff = _file_patch("big.py", 300)
+    chunks = pr_review._split_diff(diff, 1_000)
+    assert len(chunks) >= 2
+    assert all(len(chunk) <= 1_000 for chunk in chunks)
+    assert "".join(chunks) == diff
+
+
+def test_merge_part_verdicts_all_approve_is_decisive():
+    parts = [
+        Verdict(verdict="approve", summary="part one clean"),
+        Verdict(verdict="approve", summary="part two clean"),
+    ]
+    merged = pr_review._merge_part_verdicts(parts)
+    assert merged.verdict == "approve"
+    assert merged.summary.startswith("Reviewed in 2 parts")
+    assert merged.unread is False
+
+
+def test_merge_part_verdicts_request_changes_wins():
+    parts = [
+        Verdict(verdict="approve", summary="ok"),
+        Verdict(verdict="request_changes", summary="broken", findings=["defect"]),
+        Verdict(verdict="approve", summary="fine"),
+    ]
+    merged = pr_review._merge_part_verdicts(parts)
+    assert merged.verdict == "request_changes"
+    assert merged.findings == ["defect"]
+
+
+def test_merge_part_verdicts_comment_when_a_part_cannot_tell():
+    parts = [
+        Verdict(verdict="approve", summary="ok"),
+        Verdict(verdict="comment", summary="unclear"),
+    ]
+    merged = pr_review._merge_part_verdicts(parts)
+    assert merged.verdict == "comment"
