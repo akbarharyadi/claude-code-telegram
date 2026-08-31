@@ -33,6 +33,7 @@ jobs:
           rsync -a --delete \
             --exclude .env \
             --exclude state/ \
+            --exclude memory/ \
             --exclude .git \
             --exclude .venv \
             --exclude '__pycache__/' \
