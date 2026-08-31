@@ -693,6 +693,33 @@ class Outcome:
     posted: bool = False
 
 
+# Seconds to back off between settle checks when the head keeps moving.
+_STABLE_DIFF_BACKOFF = 5
+
+
+async def _stable_diff(pr: PullRequest, attempts: int = 3) -> str:
+    """Fetch the diff only once the head has settled, so the text we review and
+    the commit the review gets pinned to can never disagree.
+
+    A push landing mid-review (or GitHub serving the previous head's cached
+    diff) once made us post the prior round's findings under the new commit's
+    ID — a false changes-requested the author could never reproduce. Reading
+    the head on both sides of the diff fetch closes that window.
+    """
+    for attempt in range(attempts):
+        sha_before = await head_sha(pr)
+        diff = await fetch_diff(pr)
+        sha_after = await head_sha(pr)
+        if sha_before == sha_after:
+            pr.head_sha = sha_after
+            return diff
+        await asyncio.sleep(_STABLE_DIFF_BACKOFF * (attempt + 1))
+    raise ReviewError(
+        "the PR head kept moving while the diff was fetched; skipping this "
+        "round so the review never describes the wrong commit"
+    )
+
+
 async def review_one(pr: PullRequest, *, mode: str, dry_run: bool) -> Outcome:
     """Decide on one PR and, unless dry_run, post the review."""
     if mode == "approve":
@@ -703,7 +730,7 @@ async def review_one(pr: PullRequest, *, mode: str, dry_run: bool) -> Outcome:
         )
     else:
         try:
-            diff = await fetch_diff(pr)
+            diff = await _stable_diff(pr)
         except DiffTooLarge:
             verdict = Verdict(
                 verdict="comment",

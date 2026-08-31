@@ -362,6 +362,7 @@ async def test_an_oversized_diff_comments_instead_of_approving(monkeypatch):
         raise AssertionError("must not consult the model on a diff it cannot read")
 
     monkeypatch.setattr(pr_review, "fetch_diff", too_big)
+    monkeypatch.setattr(pr_review, "head_sha", _settled_head)
     monkeypatch.setattr(pr_review, "ask_claude", explode)
     pr = PullRequest(repo="o/r", number=798, title="huge", author="someone", url="u")
 
@@ -478,6 +479,7 @@ async def test_an_approval_posts_no_inline_comments(monkeypatch):
         )
 
     monkeypatch.setattr(pr_review, "fetch_diff", _tiny_diff)
+    monkeypatch.setattr(pr_review, "head_sha", _settled_head)
     monkeypatch.setattr(pr_review, "ask_claude", approving)
     pr = PullRequest(repo="o/r", number=9, title="t", author="someone", url="u")
 
@@ -498,6 +500,7 @@ async def test_requested_changes_keep_their_inline_comments(monkeypatch):
         )
 
     monkeypatch.setattr(pr_review, "fetch_diff", _tiny_diff)
+    monkeypatch.setattr(pr_review, "head_sha", _settled_head)
     monkeypatch.setattr(pr_review, "ask_claude", defect)
     pr = PullRequest(repo="o/r", number=9, title="t", author="someone", url="u")
 
@@ -518,6 +521,8 @@ async def test_review_now_reviews_a_pr_nobody_is_waiting_on(monkeypatch, tmp_pat
     monkeypatch.setattr(pr_review.config, "REVIEW_STATE_FILE", tmp_path / "reviews.json")
 
     async def fake_gh(*args, check=True, stdin_data=None):
+        if "--jq" in args:
+            return "cafe"  # head_sha reads the bare sha
         if args[:2] == ("pr", "view"):
             return (
                 '{"number": 7, "title": "the pr", "author": {"login": "someone"},'
@@ -576,6 +581,11 @@ def _file_patch(name: str, lines: int) -> str:
     return f"diff --git a/{name} b/{name}\n--- a/{name}\n+++ b/{name}\n{body}"
 
 
+async def _settled_head(pr):
+    """A head that never moves - for tests that stub fetch_diff only."""
+    return "aaa"
+
+
 def test_split_diff_keeps_one_chunk_when_it_fits():
     diff = _file_patch("a.py", 10) + _file_patch("b.py", 10)
     chunks = pr_review._split_diff(diff, 10_000)
@@ -630,3 +640,74 @@ def test_merge_part_verdicts_comment_when_a_part_cannot_tell():
     ]
     merged = pr_review._merge_part_verdicts(parts)
     assert merged.verdict == "comment"
+
+
+# ── the settle guard: diff text must match the commit it is pinned to ──────
+
+
+def _pr4157():
+    return PullRequest(repo="o/r", number=1, title="t", author="someone", url="u")
+
+
+@pytest.mark.anyio
+async def test_stable_diff_pins_a_settled_head(monkeypatch):
+    """Two agreeing head reads around the fetch -> diff is trusted."""
+    shas = iter(["aaa", "aaa"])
+
+    async def fake_head_sha(pr):
+        return next(shas)
+
+    async def fake_fetch_diff(pr):
+        return "diff --git a/f b/f\n+hi\n"
+
+    monkeypatch.setattr(pr_review, "head_sha", fake_head_sha)
+    monkeypatch.setattr(pr_review, "fetch_diff", fake_fetch_diff)
+    monkeypatch.setattr(pr_review, "_STABLE_DIFF_BACKOFF", 0)
+
+    pr = _pr4157()
+    diff = await pr_review._stable_diff(pr)
+    assert diff.startswith("diff --git")
+    assert pr.head_sha == "aaa"
+
+
+@pytest.mark.anyio
+async def test_stable_diff_retries_when_the_head_moves(monkeypatch):
+    """Head moved between reads -> wait and re-read both, then settle."""
+    shas = iter(["old", "new", "new", "new", "new"])
+
+    async def fake_head_sha(pr):
+        return next(shas)
+
+    async def fake_fetch_diff(pr):
+        return "+fresh\n"
+
+    monkeypatch.setattr(pr_review, "head_sha", fake_head_sha)
+    monkeypatch.setattr(pr_review, "fetch_diff", fake_fetch_diff)
+    monkeypatch.setattr(pr_review, "_STABLE_DIFF_BACKOFF", 0)
+
+    pr = _pr4157()
+    await pr_review._stable_diff(pr)
+    assert pr.head_sha == "new"
+
+
+@pytest.mark.anyio
+async def test_stable_diff_gives_up_on_a_moving_head(monkeypatch):
+    """A PR that will not settle is skipped, never reviewed against a guess."""
+    counter = {"n": 0}
+
+    async def fake_head_sha(pr):
+        counter["n"] += 1
+        return f"sha-{counter['n']}"
+
+    async def fake_fetch_diff(pr):
+        return "+x\n"
+
+    async def nosleep(_):
+        pass
+
+    monkeypatch.setattr(pr_review, "head_sha", fake_head_sha)
+    monkeypatch.setattr(pr_review, "fetch_diff", fake_fetch_diff)
+    monkeypatch.setattr(pr_review.asyncio, "sleep", nosleep)
+
+    with pytest.raises(ReviewError, match="kept moving"):
+        await pr_review._stable_diff(_pr4157())
