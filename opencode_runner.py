@@ -476,6 +476,14 @@ async def _decide_permission(client: httpx.AsyncClient, spec: RunSpec, data: dic
     permission_id = str(data.get("id") or "")
     session_id = str(data.get("sessionID") or "")
 
+    if spec.env_extra.get("CCTG_REVIEW"):
+        # A review run executes as the locked agent, whose mutating tools do
+        # not exist — so the only ask that can surface is a read gate (the
+        # deep-review worktree sits outside the configured dirs). Allow it:
+        # rejecting here once killed a whole seven-minute review mid-flight.
+        await _reply_permission(client, session_id, permission_id, "once")
+        return
+
     if not context["run_id"] or not context["chat_id"]:
         # Not a bot-launched run (doctor, manual use). Do not hijack it, but a
         # pending ask must not hang the stream either — the default is reject.
