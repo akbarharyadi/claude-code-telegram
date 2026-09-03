@@ -1143,8 +1143,10 @@ async def watch(on_report) -> None:
                     log.warning("%s: %s", out.pr.key, out.error)
                 elif out.posted:
                     log.info("%s: posted %s", out.pr.key, out.verdict.verdict)
-            if outcomes:
-                await _safe_report(on_report, summarize(outcomes))
+                # Report each review as it lands - a batch at the end of a long
+                # sweep dies with the process and the owner sees nothing.
+                if out.posted or out.error:
+                    await _safe_report(on_report, summarize([out]))
         except ReviewError as exc:
             log.warning("review sweep failed: %s", exc)
             await _safe_report(on_report, f"?? Review sweep failed: {exc}")
