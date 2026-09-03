@@ -1023,6 +1023,7 @@ async def sweep(
             pr.head_sha = await head_sha(pr)
             if not force and seen.get(pr.key) == pr.head_sha:
                 continue  # already reviewed at this commit
+            log.info("reviewing %s", pr.key)
             outcome = await review_one(pr, mode=mode, dry_run=dry_run)
         except ReviewError as exc:
             outcomes.append(Outcome(pr=pr, error=str(exc)))
@@ -1093,19 +1094,40 @@ def summarize(outcomes: list[Outcome], *, dry_run: bool = False) -> str:
     return text
 
 
+async def _safe_report(on_report, text: str) -> None:
+    """Deliver a report, but never let a failed Telegram send kill the watcher.
+
+    The outage of Sep 03 killed the watch task exactly here: the sweep failed
+    on a dead network, the failure report hit the same dead network, and the
+    unhandled exception silenced every review until the next restart.
+    """
+    try:
+        await on_report(text)
+    except Exception:  # noqa: BLE001 - the watcher must outlive its reports
+        log.exception("review report could not be delivered")
+
+
 async def watch(on_report) -> None:
     """Sweep on a timer forever, calling `on_report(text)` when something happened."""
     while True:
         try:
+            log.info("review sweep starting (mode=%s)", config.REVIEW_MODE)
             outcomes = await sweep()
+            for out in outcomes:
+                if out.error:
+                    log.warning("%s: %s", out.pr.key, out.error)
+                elif out.posted:
+                    log.info("%s: posted %s", out.pr.key, out.verdict.verdict)
             if outcomes:
-                await on_report(summarize(outcomes))
+                await _safe_report(on_report, summarize(outcomes))
         except ReviewError as exc:
-            await on_report(f"⚠️ Review sweep failed: {exc}")
+            log.warning("review sweep failed: %s", exc)
+            await _safe_report(on_report, f"?? Review sweep failed: {exc}")
         except asyncio.CancelledError:
             raise
-        except Exception as exc:  # noqa: BLE001
-            await on_report(f"⚠️ Review sweep crashed: {type(exc).__name__}: {exc}")
+        except Exception:  # noqa: BLE001
+            log.exception("review sweep crashed")
+            await _safe_report(on_report, "?? Review sweep crashed - see the server journal")
         await asyncio.sleep(config.REVIEW_POLL_SECONDS)
 
 
