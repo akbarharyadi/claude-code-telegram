@@ -991,14 +991,20 @@ async def post_init(app: Application) -> None:
     # Tell the owner the bot came (back) up - a silent restart after a crash
     # or a deploy is otherwise invisible until something breaks.
     if config.DEFAULT_CHAT_ID:
-        with contextlib.suppress(TelegramError):
-            await app.bot.send_message(
-                chat_id=config.DEFAULT_CHAT_ID,
-                text=(
-                    f"🟢 Bot back online as @{me.username}"
-                    f" (mode: {config.AGENT_BACKEND}, reviews: {config.REVIEW_MODE})."
-                ),
-            )
+        notice = (
+            f"🟢 Bot back online as @{me.username}"
+            f" (mode: {config.AGENT_BACKEND}, reviews: {config.REVIEW_MODE})."
+        )
+        for attempt in range(3):
+            try:
+                await app.bot.send_message(chat_id=config.DEFAULT_CHAT_ID, text=notice)
+                log.info("startup notification delivered")
+                break
+            except TelegramError:
+                if attempt == 2:
+                    log.warning("startup notification could not be delivered")
+                else:
+                    await asyncio.sleep(5)
 
     # Plain asyncio, not Application.create_task: post_init runs before the
     # application is started, and PTB will not adopt a task created that early.
