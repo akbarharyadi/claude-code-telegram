@@ -205,6 +205,29 @@ def test_request_changes_label_the_collapsed_section_as_defects():
     assert "Defects found" in body
 
 
+def test_findings_bold_their_leading_file_path():
+    body = pr_review.render_body(
+        Verdict(
+            verdict="approve",
+            summary="ok",
+            findings=["`app/x.py` — the clamp holds", "unanchored note"],
+        )
+    )
+    assert "- **`app/x.py`** — the clamp holds" in body
+    assert "- unanchored note" in body
+
+
+def test_deep_review_carries_a_meta_strip():
+    pr = PullRequest(repo="o/r", number=1, title="t", author="s", url="u", head_sha="abc1234def")
+    body = pr_review.render_body(
+        Verdict(verdict="approve", summary="ok", deep=True), pr=pr, model="glm-5.3"
+    )
+    assert "repo-aware deep review" in body
+    assert "model `glm-5.3`" in body
+    assert "head `abc1234def`" in body
+    assert "Deep review:" not in body  # the old summary prefix is gone
+
+
 @pytest.mark.anyio
 async def test_an_oversized_diff_is_reviewed_in_parts_and_stays_decisive(monkeypatch):
     """Chunking covers the whole diff, so a big PR can still be approved —
@@ -784,7 +807,7 @@ async def test_deep_mode_reads_real_code_inside_a_worktree(monkeypatch, tmp_path
     assert outcome.verdict is not None and outcome.verdict.verdict == "approve"
     assert specs_cwd(capture) == str(worktree)
     assert "checked out at the PR's" in capture[0].prompt
-    assert "Deep review" in outcome.verdict.summary
+    assert outcome.verdict.deep is True
     assert dropped == [worktree]
 
 

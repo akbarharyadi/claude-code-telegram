@@ -90,6 +90,7 @@ class Verdict:
     comments: list[LineComment] = field(default_factory=list)
     unread: bool = False  # True when nothing actually read the diff
     cost_usd: float = 0.0
+    deep: bool = False  # True when the repo itself was checked out and read
 
 
 # ── talking to gh ─────────────────────────────────────────────────────────
@@ -338,7 +339,10 @@ async def submit_review(pr: PullRequest, verdict: Verdict) -> None:
         "request_changes": "REQUEST_CHANGES",
         "comment": "COMMENT",
     }[verdict.verdict]
-    payload: dict[str, object] = {"event": event, "body": render_body(verdict)}
+    payload: dict[str, object] = {
+        "event": event,
+        "body": render_body(verdict, pr=pr, model=config.REVIEW_MODEL),
+    }
     if pr.head_sha:
         # Pin the comments to the exact commit that was read.
         payload["commit_id"] = pr.head_sha
@@ -515,12 +519,12 @@ Reply with ONLY a fenced json block and nothing else:
    "body": "<note for that exact line>"}}]}}
 ```
 
-The "summary" field — 4-6 short sentences: what changed, what you traced in the
-repo (files you opened and why), the defect classes you hunted — correctness,
-injection, tenant or auth scoping, data loss, race conditions, off-by-one,
-unhandled None/empty/error — and what came up clean. The "findings" field —
-concrete, self-contained bullets, at least one per touched file: an em dash,
-then what you verified or flagged, citing the code you actually read.
+The "summary" field — 3-4 short sentences: what the change does and the
+headline of what you verified; keep file-level detail in "findings". The
+"findings" field — concrete, self-contained bullets, at least one per touched
+file. FORMAT: every bullet MUST start with the file path in backticks, then an
+em dash, then one or two sentences on what you verified or flagged, citing the
+code you actually read.
 The "comments" field — OPTIONAL inline notes anchored to one exact new-side
 line; broader or cross-file defects belong in "findings". Never invent a path
 or line number.
@@ -573,14 +577,13 @@ Verdict rules for ONE part:
   file and what breaks.
 - "comment" — this part alone is unintelligible. Say why in "summary".
 
-The "summary" field — 2-4 short sentences naming the files in this part and
-what you verified about each, citing the repo files you opened. The "findings"
-field — one bullet per touched file or logical theme in this part: an em dash,
-then what you verified or flagged, with file:line receipts. The "comments"
-field — OPTIONAL inline notes anchored to one exact new-side line in THIS
-part; broader defects belong in "findings". Never invent a path or line
-number — unanchorable notes get dropped and one wrong anchor can void the
-whole review.
+The "summary" field — 2-3 short sentences on what this part does and what you
+verified. The "findings" field — one bullet per touched file or logical theme
+in this part; every bullet MUST start with the file path in backticks, then an
+em dash, then what you verified or flagged. The "comments" field — OPTIONAL
+inline notes anchored to one exact new-side line in THIS part; broader defects
+belong in "findings". Never invent a path or line number — unanchorable notes
+get dropped and one wrong anchor can void the whole review.
 """
 
 
@@ -670,11 +673,7 @@ async def ask_claude(pr: PullRequest, diff: str, *, mode: str = "quick") -> Verd
         if worktree:
             await _drop_worktree(worktree, clone)
 
-    if worktree:
-        verdict.summary = (
-            "Deep review: the repo was checked out at the PR head and the code "
-            "was read, not just the diff. " + verdict.summary
-        )
+    verdict.deep = bool(worktree)
     return verdict
 
 
@@ -798,10 +797,30 @@ _VERDICT_HEADER = {
 }
 
 
-def render_body(verdict: Verdict) -> str:
-    """The comment that goes on the PR: a verdict header, a short summary, and
-    the evidence folded into a collapsible section so the diff stays readable."""
+def _pretty_finding(finding: str) -> str:
+    """One bullet. Bold the leading backticked file path so a long list stays
+    scannable - the eye should land on filenames, not prose."""
+    m = re.match(r"^\s*`([^`]+)`\s*[—–-]?\s*(.*)$", finding, re.S)
+    if m:
+        return f"- **`{m.group(1)}`** — {m.group(2)}"
+    return f"- {finding}"
+
+
+def render_body(verdict: Verdict, pr: PullRequest | None = None, model: str = "") -> str:
+    """The comment that goes on the PR: a verdict header, a one-line meta strip,
+    a short summary, and the evidence folded away so the diff stays readable."""
     lines: list[str] = [f"## {_VERDICT_HEADER.get(verdict.verdict, '💬 Review')}"]
+
+    meta: list[str] = []
+    if verdict.deep:
+        meta.append("🔍 repo-aware deep review")
+    if model:
+        meta.append(f"model `{model}`")
+    if pr is not None and pr.head_sha:
+        meta.append(f"head `{pr.head_sha[:10]}`")
+    if meta:
+        lines += ["", "> " + " · ".join(meta)]
+
     if verdict.unread:
         lines += [
             "",
@@ -809,18 +828,23 @@ def render_body(verdict: Verdict) -> str:
             "> Filed without reading the diff — a rubber stamp, not a review.",
         ]
     if verdict.summary:
-        lines += ["", verdict.summary]
+        lines += ["", "**Summary**", "", verdict.summary]
     if verdict.findings:
         label = "Defects found" if verdict.verdict == "request_changes" else "What was verified"
         lines += [
             "",
             "<details>",
-            f"<summary>{label}</summary>",
+            f"<summary>📋 {label} ({len(verdict.findings)})</summary>",
             "",
-            *[f"- {finding}" for finding in verdict.findings],
+            *[_pretty_finding(finding) for finding in verdict.findings],
             "",
             "</details>",
         ]
+    lines += [
+        "",
+        "---",
+        "🤖 Automated review by cctg — read-only investigation, no code was executed.",
+    ]
     return "\n".join(lines).strip()
 
 
