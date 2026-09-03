@@ -752,7 +752,7 @@ async def cmd_reviews(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     args = [a.lower() for a in (context.args or [])]
     dry_run = "dry" in args
     force = "force" in args
-    mode = next((a for a in args if a in ("quick", "approve")), "")
+    mode = next((a for a in args if a in ("quick", "deep", "approve")), "")
 
     if not config.REVIEW_REPOS:
         await update.effective_message.reply_text(
@@ -795,8 +795,8 @@ def _parse_review_target(rest: str) -> tuple[str, int, str, bool] | None:
     """'owner/repo#123 [dry|quick|approve]' in any spacing — None if it is not one."""
     words = rest.split()
     dry_run = any(w.lower() == "dry" for w in words)
-    mode = next((w.lower() for w in words if w.lower() in ("quick", "approve")), "")
-    target = " ".join(w for w in words if w.lower() not in ("dry", "quick", "approve"))
+    mode = next((w.lower() for w in words if w.lower() in ("quick", "deep", "approve")), "")
+    target = " ".join(w for w in words if w.lower() not in ("dry", "quick", "deep", "approve"))
     m = _REVIEW_TARGET.fullmatch(target)
     if not m or not m.group("number"):
         return None

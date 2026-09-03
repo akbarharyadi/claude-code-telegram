@@ -151,13 +151,14 @@ Each chat keeps its own session. In a forum-style group, each topic gets its own
 
 ```
 REVIEW_REPOS=octocorp/api octocorp/web    # required — empty means it refuses to run
-REVIEW_MODE=quick                          # quick | approve
+REVIEW_MODE=quick                          # quick | deep | approve
 REVIEW_WATCH=1                             # also sweep every REVIEW_POLL_SECONDS
 ```
 
-Two modes:
+Three modes:
 
 - **`quick`** *(default)* — Claude reads the diff and approves, requests changes, or comments. Roughly a minute and a few cents per PR.
+- **`deep`** — the PR head is checked out into a throwaway worktree under `REVIEW_CLONE_ROOT/<repo-name>`, and the reviewer reads the real code — surrounding functions, call sites, configs, tests — before judging. Slower and pricier; far fewer false verdicts on non-trivial PRs. Falls back to `quick` when the repo is not cloned locally. The locked-down agent still gets no shell, no writes.
 - **`approve`** — approves without reading anything. Fast, and honest about it: the review body says outright that nothing read the diff.
 
 ### Know what you are automating

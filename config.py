@@ -303,6 +303,10 @@ REVIEW_MODEL = (
     or ("" if AGENT_BACKEND == "opencode" else "claude-opus-5")
 )
 REVIEW_EFFORT = _clean(os.getenv("REVIEW_EFFORT")) or "low"
+# "deep" mode: check the PR head out into a worktree under a local clone of
+# the repo (REVIEW_CLONE_ROOT/<repo-name>) so the reviewer can read real code.
+# Empty disables deep mode - deep reviews then fall back to diff-only.
+REVIEW_CLONE_ROOT = _clean(os.getenv("REVIEW_CLONE_ROOT"))
 REVIEW_SKIP_DRAFTS = _bool(os.getenv("REVIEW_SKIP_DRAFTS"), True)
 REVIEW_TIMEOUT_SECONDS = _int(os.getenv("REVIEW_TIMEOUT_SECONDS"), 600)
 REVIEW_POLL_SECONDS = _int(os.getenv("REVIEW_POLL_SECONDS"), 900)

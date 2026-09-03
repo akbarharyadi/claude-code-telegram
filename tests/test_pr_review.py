@@ -471,7 +471,7 @@ async def test_an_approval_posts_no_inline_comments(monkeypatch):
     """Inline notes are for defects only — verification receipts on a clean
     approval just spam every hunk of the diff."""
 
-    async def approving(pr, diff):
+    async def approving(pr, diff, mode="quick"):
         return Verdict(
             verdict="approve",
             summary="clean",
@@ -492,7 +492,7 @@ async def test_an_approval_posts_no_inline_comments(monkeypatch):
 
 @pytest.mark.anyio
 async def test_requested_changes_keep_their_inline_comments(monkeypatch):
-    async def defect(pr, diff):
+    async def defect(pr, diff, mode="quick"):
         return Verdict(
             verdict="request_changes",
             summary="one defect",
@@ -554,7 +554,7 @@ async def _tiny_diff(pr):
     return "diff --git a/x.py b/x.py\n+++ b/x.py\n@@ -1 +1 @@\n-ok\n+fine\n"
 
 
-async def _ok_verdict(pr, diff):
+async def _ok_verdict(pr, diff, mode="quick"):
     return Verdict(verdict="approve", summary="ok")
 
 
@@ -711,3 +711,80 @@ async def test_stable_diff_gives_up_on_a_moving_head(monkeypatch):
 
     with pytest.raises(ReviewError, match="kept moving"):
         await pr_review._stable_diff(_pr4157())
+
+
+# ── deep mode: repo-aware review inside a worktree ────────────────────────
+
+
+def _approve_stream(capture: list):
+    async def fake_stream(spec):
+        capture.append(spec)
+        yield type(
+            "E", (), {"kind": "text", "text": '{"verdict": "approve", "summary": "ok"}'}
+        )()
+        yield type(
+            "E", (), {"kind": "result", "text": "", "cost_usd": 0.0, "is_error": False}
+        )()
+
+    return fake_stream
+
+
+@pytest.mark.anyio
+async def test_deep_mode_without_a_clone_falls_back_to_diff_only(monkeypatch):
+    monkeypatch.setattr(pr_review.config, "REVIEW_CLONE_ROOT", "")
+    capture: list = []
+    monkeypatch.setattr(pr_review, "stream_run", _approve_stream(capture))
+    pr = _pr4157()
+
+    verdict = await pr_review.ask_claude(pr, await _tiny_diff(pr), mode="deep")
+
+    assert verdict.verdict == "approve"
+    assert capture[0].cwd == str(pr_review.config.ROOT)
+    assert "checked out at the PR's head" not in capture[0].prompt
+    assert "Deep review" not in verdict.summary
+
+
+@pytest.mark.anyio
+async def test_deep_mode_reads_real_code_inside_a_worktree(monkeypatch, tmp_path):
+    worktree = tmp_path / "wt"
+    worktree.mkdir()
+    clone = tmp_path / "clone"
+    (clone / ".git").mkdir(parents=True)
+
+    async def fake_worktree(pr, sha):
+        assert sha == "aaa"
+        return worktree, clone
+
+    dropped: list = []
+
+    async def fake_drop(wt, cl):
+        dropped.append(wt)
+
+    monkeypatch.setattr(pr_review, "_repo_worktree", fake_worktree)
+    monkeypatch.setattr(pr_review, "_drop_worktree", fake_drop)
+    capture: list = []
+    monkeypatch.setattr(pr_review, "stream_run", _approve_stream(capture))
+
+    async def settled(pr):
+        return "aaa"
+
+    monkeypatch.setattr(pr_review, "head_sha", settled)
+    monkeypatch.setattr(pr_review, "fetch_diff", _tiny_diff)
+    pr = _pr4157()
+
+    outcome = await pr_review.review_one(pr, mode="deep", dry_run=True)
+
+    assert outcome.verdict is not None and outcome.verdict.verdict == "approve"
+    assert specs_cwd(capture) == str(worktree)
+    assert "checked out at the PR's" in capture[0].prompt
+    assert "Deep review" in outcome.verdict.summary
+    assert dropped == [worktree]
+
+
+def specs_cwd(capture: list) -> str:
+    return capture[0].cwd
+
+
+def test_deep_mode_is_an_accepted_mode(monkeypatch):
+    monkeypatch.setattr(pr_review.config, "REVIEW_REPOS", ["o/r"])
+    assert pr_review._check_mode("deep") == "deep"
