@@ -412,8 +412,15 @@ async def test_limit_stops_the_sweep_early(monkeypatch, tmp_path):
         reviewed.append(pr.number)
         return pr_review.Outcome(pr=pr, verdict=Verdict(verdict="approve"), posted=False)
 
+    async def fake_head_sha(pr):
+        return "deadbeef"
+
+    async def not_merged(*args, **kwargs):
+        return False
+
     monkeypatch.setattr(pr_review, "find_pending", fake_pending)
-    monkeypatch.setattr(pr_review, "head_sha", lambda pr: _sha())
+    monkeypatch.setattr(pr_review, "head_sha", fake_head_sha)
+    monkeypatch.setattr(pr_review, "pr_merged", not_merged)
     monkeypatch.setattr(pr_review, "review_one", fake_review_one)
 
     outcomes = await pr_review.sweep(mode="quick", dry_run=True, limit=1)
@@ -788,3 +795,74 @@ def specs_cwd(capture: list) -> str:
 def test_deep_mode_is_an_accepted_mode(monkeypatch):
     monkeypatch.setattr(pr_review.config, "REVIEW_REPOS", ["o/r"])
     assert pr_review._check_mode("deep") == "deep"
+
+
+@pytest.mark.anyio
+async def test_a_merged_pr_is_skipped_without_review(monkeypatch, tmp_path):
+    """A PR that landed before its turn needs no review - and no model time."""
+    monkeypatch.setattr(pr_review.config, "REVIEW_REPOS", ["o/r"])
+    monkeypatch.setattr(pr_review.config, "REVIEW_LOGIN", "work-account")
+    monkeypatch.setattr(pr_review.config, "REVIEW_STATE_FILE", tmp_path / "reviews.json")
+
+    async def fake_whoami():
+        return "work-account"
+
+    async def fake_pending(repos, me):
+        return [PullRequest(repo="o/r", number=8, title="landed", author="someone", url="u")]
+
+    reviewed: list[int] = []
+
+    async def fake_review_one(pr, *, mode, dry_run):
+        reviewed.append(pr.number)
+        return pr_review.Outcome(pr=pr, verdict=Verdict(verdict="approve"), posted=False)
+
+    async def fake_head_sha(pr):
+        return "abc"
+
+    async def merged(*args, **kwargs):
+        return True
+
+    monkeypatch.setattr(pr_review, "whoami", fake_whoami)
+    monkeypatch.setattr(pr_review, "find_pending", fake_pending)
+    monkeypatch.setattr(pr_review, "head_sha", fake_head_sha)
+    monkeypatch.setattr(pr_review, "pr_merged", merged)
+    monkeypatch.setattr(pr_review, "review_one", fake_review_one)
+
+    outcomes = await pr_review.sweep()
+
+    assert outcomes == []
+    assert reviewed == []
+
+
+@pytest.mark.anyio
+async def test_an_open_pr_still_gets_reviewed(monkeypatch, tmp_path):
+    monkeypatch.setattr(pr_review.config, "REVIEW_REPOS", ["o/r"])
+    monkeypatch.setattr(pr_review.config, "REVIEW_LOGIN", "work-account")
+    monkeypatch.setattr(pr_review.config, "REVIEW_STATE_FILE", tmp_path / "reviews.json")
+
+    async def fake_whoami():
+        return "work-account"
+
+    async def fake_pending(repos, me):
+        return [PullRequest(repo="o/r", number=9, title="open", author="someone", url="u")]
+
+    async def fake_review_one(pr, *, mode, dry_run):
+        return pr_review.Outcome(pr=pr, verdict=Verdict(verdict="approve"), posted=True)
+
+    async def fake_head_sha(pr):
+        return "def"
+
+    async def not_merged(*args, **kwargs):
+        return False
+
+    monkeypatch.setattr(pr_review, "whoami", fake_whoami)
+    monkeypatch.setattr(pr_review, "find_pending", fake_pending)
+    monkeypatch.setattr(pr_review, "head_sha", fake_head_sha)
+    monkeypatch.setattr(pr_review, "pr_merged", not_merged)
+    monkeypatch.setattr(pr_review, "review_one", fake_review_one)
+
+    outcomes = await pr_review.sweep()
+
+    assert len(outcomes) == 1
+    state = json.loads((tmp_path / "reviews.json").read_text(encoding="utf-8"))
+    assert state == {"o/r#9": "def"}

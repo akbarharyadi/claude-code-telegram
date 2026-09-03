@@ -180,6 +180,28 @@ async def find_pending(repos: list[str], me: str) -> list[PullRequest]:
     return out
 
 
+async def pr_merged(pr: PullRequest) -> bool:
+    """True when the PR was merged or closed after discovery.
+
+    A merged PR needs no review - posting one would only spend ten minutes of
+    model time decorating a change that already landed.
+    """
+    state = (
+        await _gh(
+            "pr",
+            "view",
+            str(pr.number),
+            "--repo",
+            pr.repo,
+            "--json",
+            "state",
+            "--jq",
+            ".state",
+        )
+    ).strip().lower()
+    return state != "open"
+
+
 async def head_sha(pr: PullRequest) -> str:
     """The current head commit, so we re-review only when the code moved."""
     raw = await _gh(
@@ -1023,6 +1045,9 @@ async def sweep(
             pr.head_sha = await head_sha(pr)
             if not force and seen.get(pr.key) == pr.head_sha:
                 continue  # already reviewed at this commit
+            if await pr_merged(pr):
+                log.info("%s: merged/closed - skipping", pr.key)
+                continue
             log.info("reviewing %s", pr.key)
             outcome = await review_one(pr, mode=mode, dry_run=dry_run)
         except ReviewError as exc:
