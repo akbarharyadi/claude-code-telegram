@@ -548,10 +548,14 @@ async def test_requested_changes_keep_their_inline_comments(monkeypatch):
     async def no_discussion(*args, **kwargs):
         return ""
 
+    async def no_rounds(*args, **kwargs):
+        return 0
+
     monkeypatch.setattr(pr_review, "fetch_diff", _tiny_diff)
     monkeypatch.setattr(pr_review, "fetch_discussion", no_discussion)
     monkeypatch.setattr(pr_review, "head_sha", _settled_head)
     monkeypatch.setattr(pr_review, "ask_claude", defect)
+    monkeypatch.setattr(pr_review, "changes_requested_rounds", no_rounds)
     pr = PullRequest(repo="o/r", number=9, title="t", author="someone", url="u")
 
     outcome = await pr_review.review_one(pr, mode="quick", dry_run=True)
@@ -1061,3 +1065,119 @@ async def test_an_open_pr_still_gets_reviewed(monkeypatch, tmp_path):
     assert len(outcomes) == 1
     state = json.loads((tmp_path / "reviews.json").read_text(encoding="utf-8"))
     assert state == {"o/r#9": "def"}
+
+
+# ── the request-changes threshold ─────────────────────────────────────────
+
+
+async def _defect_verdict(pr, diff, mode="quick", discussion=""):
+    return Verdict(
+        verdict="request_changes",
+        summary="still broken",
+        findings=["`x.py` — the race survives"],
+        comments=[pr_review.LineComment(path="x.py", line=1, body="still racy")],
+    )
+
+
+async def _no_discussion(*args, **kwargs):
+    return ""
+
+
+def _rounds(n):
+    async def count(pr, me):
+        return n
+
+    return count
+
+
+async def _review_at_rounds(monkeypatch, rounds, limit=2):
+    """review_one with the model pinned to a defect verdict and GitHub pinned
+    to `rounds` prior change requests from us."""
+    monkeypatch.setattr(pr_review.config, "REVIEW_CHANGES_LIMIT", limit)
+    monkeypatch.setattr(pr_review, "fetch_diff", _tiny_diff)
+    monkeypatch.setattr(pr_review, "fetch_discussion", _no_discussion)
+    monkeypatch.setattr(pr_review, "head_sha", _settled_head)
+    monkeypatch.setattr(pr_review, "ask_claude", _defect_verdict)
+    monkeypatch.setattr(pr_review, "changes_requested_rounds", _rounds(rounds))
+    pr = _pr4157()
+    return await pr_review.review_one(pr, mode="quick", dry_run=True, me="me")
+
+
+@pytest.mark.anyio
+async def test_a_defect_below_the_limit_still_requests_changes(monkeypatch):
+    outcome = await _review_at_rounds(monkeypatch, rounds=1)
+    assert outcome.verdict is not None
+    assert outcome.verdict.verdict == "request_changes"
+    assert outcome.verdict.auto_approved is False
+
+
+@pytest.mark.anyio
+async def test_a_defect_at_the_limit_auto_approves_with_comment(monkeypatch):
+    """Two rounds is the deal: past it the verdict is filed as an approval
+    that still carries the defects — body findings and inline notes both."""
+    outcome = await _review_at_rounds(monkeypatch, rounds=2)
+    assert outcome.verdict is not None
+    assert outcome.verdict.verdict == "approve"
+    assert outcome.verdict.auto_approved is True
+    assert outcome.verdict.findings == ["`x.py` — the race survives"]
+    assert [(c.path, c.body) for c in outcome.verdict.comments] == [("x.py", "still racy")]
+
+
+@pytest.mark.anyio
+async def test_a_zero_limit_disables_the_threshold(monkeypatch):
+    outcome = await _review_at_rounds(monkeypatch, rounds=9, limit=0)
+    assert outcome.verdict is not None
+    assert outcome.verdict.verdict == "request_changes"
+
+
+def test_the_auto_approved_body_says_why():
+    body = pr_review.render_body(
+        Verdict(
+            verdict="approve",
+            summary="still broken",
+            findings=["`x.py` — the race survives"],
+            auto_approved=True,
+        )
+    )
+    assert "Auto-approved" in body
+    assert "Defects found" in body  # an auto-approval's findings ARE defects
+
+
+@pytest.mark.anyio
+async def test_change_rounds_count_since_the_last_approval(monkeypatch):
+    """GitHub is the record: our CHANGES_REQUESTED reviews since our last
+    APPROVED one. Other people's reviews never count."""
+    reviews = [
+        {"user": {"login": "me"}, "state": "CHANGES_REQUESTED"},
+        {"user": {"login": "me"}, "state": "APPROVED"},
+        {"user": {"login": "alice"}, "state": "CHANGES_REQUESTED"},
+        {"user": {"login": "me"}, "state": "CHANGES_REQUESTED"},
+        {"user": {"login": "me"}, "state": "CHANGES_REQUESTED"},
+        {"user": {"login": "me"}, "state": "COMMENTED"},
+    ]
+
+    async def fake_gh(*args, **kwargs):
+        return json.dumps(reviews)
+
+    monkeypatch.setattr(pr_review, "_gh", fake_gh)
+    pr = _pr4157()
+
+    assert await pr_review.changes_requested_rounds(pr, "me") == 2
+
+
+@pytest.mark.anyio
+async def test_change_rounds_survive_a_dead_endpoint(monkeypatch):
+    """A failed count reads as zero — worst case one extra changes-requested
+    round, never a skipped review."""
+    async def fake_gh(*args, **kwargs):
+        raise ReviewError("gh api failed (1): connection reset")
+
+    monkeypatch.setattr(pr_review, "_gh", fake_gh)
+    assert await pr_review.changes_requested_rounds(_pr4157(), "me") == 0
+
+
+def test_summarize_notes_an_auto_approval():
+    pr = PullRequest(repo="o/r", number=7, title="t", author="a", url="u")
+    verdict = Verdict(verdict="approve", summary="ok", auto_approved=True)
+    text = pr_review.summarize([pr_review.Outcome(pr=pr, verdict=verdict, posted=True)])
+    assert "auto-approved" in text

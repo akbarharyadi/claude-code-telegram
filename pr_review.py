@@ -91,6 +91,7 @@ class Verdict:
     unread: bool = False  # True when nothing actually read the diff
     cost_usd: float = 0.0
     deep: bool = False  # True when the repo itself was checked out and read
+    auto_approved: bool = False  # request_changes downgraded at the round limit
 
 
 # ── talking to gh ─────────────────────────────────────────────────────────
@@ -316,6 +317,37 @@ async def fetch_discussion(pr: PullRequest, me: str) -> str:
         if nl >= 0:
             text = text[nl + 1:]
     return text
+
+
+async def changes_requested_rounds(pr: PullRequest, me: str) -> int:
+    """How many REQUEST_CHANGES reviews of ours this PR carries since our last
+    APPROVED one.
+
+    Read from GitHub rather than the local state file, so it counts exactly
+    what the author sees and survives restarts, wiped state, and one-off
+    `/review` commands. An approval resets the count: a fresh round of defects
+    after new commits earns a fresh set of change requests.
+    """
+    try:
+        raw = await _gh("api", f"repos/{pr.repo}/pulls/{pr.number}/reviews")
+    except ReviewError:
+        log.warning("%s: reviews fetch failed; assuming no prior change rounds", pr.key)
+        return 0
+    try:
+        rows = json.loads(raw or "[]")
+    except json.JSONDecodeError:
+        return 0
+    rounds = 0
+    for row in rows if isinstance(rows, list) else []:
+        who = str((row.get("user") or {}).get("login") or "")
+        if who.lower() != me.lower():
+            continue
+        state = str(row.get("state") or "").upper()
+        if state == "APPROVED":
+            rounds = 0
+        elif state == "CHANGES_REQUESTED":
+            rounds += 1
+    return rounds
 
 
 # ── anchoring inline comments ─────────────────────────────────────────────
@@ -922,10 +954,23 @@ def render_body(verdict: Verdict, pr: PullRequest | None = None, model: str = ""
             "> [!WARNING]",
             "> Filed without reading the diff — a rubber stamp, not a review.",
         ]
+    if verdict.auto_approved:
+        lines += [
+            "",
+            "> [!IMPORTANT]",
+            "> Auto-approved: the limit of requested-changes rounds on this PR was",
+            "> already reached, so this round is filed as an approval to keep the",
+            "> queue moving. The defects below still stand — fix them or dismiss",
+            "> this review in a follow-up.",
+        ]
     if verdict.summary:
         lines += ["", "**Summary**", "", verdict.summary]
     if verdict.findings:
-        label = "Defects found" if verdict.verdict == "request_changes" else "What was verified"
+        label = (
+            "Defects found"
+            if verdict.verdict == "request_changes" or verdict.auto_approved
+            else "What was verified"
+        )
         lines += [
             "",
             "<details>",
@@ -1100,6 +1145,22 @@ async def review_one(
                 # Inline notes are for things that need fixing. Verification
                 # receipts on an approval read as noise on every hunk.
                 verdict.comments = []
+            elif config.REVIEW_CHANGES_LIMIT > 0:
+                # Two rounds of requested changes is the deal. Past it the PR
+                # just bounces between author and reviewer forever, so the
+                # defects go out as an approving comment instead — the body
+                # and the inline notes still say exactly what is wrong.
+                rounds = await changes_requested_rounds(pr, me)
+                if rounds >= config.REVIEW_CHANGES_LIMIT:
+                    log.info(
+                        "%s: %d change round(s) already requested (limit %d) - "
+                        "filing this round as an approving comment",
+                        pr.key,
+                        rounds,
+                        config.REVIEW_CHANGES_LIMIT,
+                    )
+                    verdict.verdict = "approve"
+                    verdict.auto_approved = True
 
     if dry_run:
         return Outcome(pr=pr, verdict=verdict, posted=False)
@@ -1257,6 +1318,8 @@ def summarize(outcomes: list[Outcome], *, dry_run: bool = False) -> str:
         ]
         if verdict.summary:
             lines.append(_clip(verdict.summary, _SUMMARY_CHARS))
+        if verdict.auto_approved:
+            lines.append("  • auto-approved — the changes-requested limit was hit")
         for finding in verdict.findings[:_MAX_FINDINGS]:
             lines.append(f"  • {_clip(finding, _FINDING_CHARS)}")
         if len(verdict.findings) > _MAX_FINDINGS:

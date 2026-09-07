@@ -175,6 +175,7 @@ The guardrails that are already there:
 - PRs you authored are skipped; GitHub rejects a self-review anyway.
 - Drafts are skipped (`REVIEW_SKIP_DRAFTS=0` to include them).
 - A PR is reviewed once per head commit, so a re-run costs nothing until someone pushes.
+- Requested changes are capped at `REVIEW_CHANGES_LIMIT` (2) rounds per PR: past that, a further defect verdict is filed as an approval whose body still lists the defects, so the queue cannot jam on a PR nobody is going to fix. The count is read from GitHub — our change requests since our last approval — and any approval resets it. `0` disables the cap.
 - A diff too big to read is never approved — over GitHub's 20,000-line API cap, or past `MAX_DIFF_CHARS` (1.5M, about 380k tokens), it downgrades to a comment saying a person needs to look. Keep that limit generous: set it too low and Claude sees half a diff, correctly reports it cannot verify the change, and you get a useless comment instead of a verdict.
 - Claude never gets the credential. It returns a verdict; a separate function runs `gh`. A diff that tries to talk the reviewer into something cannot reach the command line.
 

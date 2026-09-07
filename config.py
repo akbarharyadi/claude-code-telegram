@@ -308,6 +308,12 @@ REVIEW_EFFORT = _clean(os.getenv("REVIEW_EFFORT")) or "low"
 # Empty disables deep mode - deep reviews then fall back to diff-only.
 REVIEW_CLONE_ROOT = _clean(os.getenv("REVIEW_CLONE_ROOT"))
 REVIEW_SKIP_DRAFTS = _bool(os.getenv("REVIEW_SKIP_DRAFTS"), True)
+# How many "request changes" reviews one PR may get before a further defect
+# verdict is filed as an approving comment instead (the defects still ride in
+# the body and as inline notes). The count is read from GitHub — our reviews
+# since our last approval — so restarts and wiped state never lose it.
+# 0 disables the cap.
+REVIEW_CHANGES_LIMIT = _int(os.getenv("REVIEW_CHANGES_LIMIT"), 2)
 REVIEW_TIMEOUT_SECONDS = _int(os.getenv("REVIEW_TIMEOUT_SECONDS"), 600)
 REVIEW_POLL_SECONDS = _int(os.getenv("REVIEW_POLL_SECONDS"), 900)
 # 0 keeps the sweep manual (/reviews); anything else also runs it on the timer.
