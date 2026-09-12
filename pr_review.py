@@ -543,8 +543,10 @@ Choosing the verdict:
 - "comment" — the diff is truncated, or you genuinely cannot tell. Say why in
   "summary".
 
-Default to "approve". This reviewer wants their queue moving, so withhold
-approval only for something that would actually bite in production.
+Default to "request_changes" whenever a plausible defect survived your
+checks — do not give the change the benefit of the doubt. This reviewer
+wants defects caught before merge, not a fast queue. Approve only when you
+could clear every hunk; style nits alone still never block approval.
 """
 
 
@@ -604,6 +606,15 @@ Investigate before judging:
   confirm every call site was updated.
 - Check configs, i18n message files, schemas and tests against what the code
   now does — a change that ignores its own tests is a defect.
+- Confirm the changed behavior is actually covered by tests: a new code path
+  with no test, or a test weakened to match broken behavior, is a finding —
+  the repo is checked out, so read the tests rather than trusting names.
+- Trace every new external input end to end (request field, query param,
+  flag, env var): validation, tenant/auth scoping, injection. Trace every
+  data mutation (migration, delete, backfill) for loss or corruption of
+  existing rows.
+- Walk the error paths yourself: failing dependency, empty list, missing
+  field, timeout. Unhandled or silently swallowed failures are findings.
 - Verify each suspicious hunk against the real files and cite file:line
   receipts you actually read.
 
@@ -649,8 +660,10 @@ Choosing the verdict:
 - "comment" — you genuinely cannot tell (e.g. the diff references code that
   does not exist in the checkout). Say what is missing in "summary".
 
-Default to "approve". This reviewer wants their queue moving, so withhold
-approval only for something that would actually bite in production.
+Default to "request_changes" whenever a plausible defect survived your
+checks — do not give the change the benefit of the doubt. This reviewer
+wants defects caught before merge, not a fast queue. Approve only when you
+could clear every hunk; style nits alone still never block approval.
 """
 
 
@@ -660,8 +673,12 @@ behalf of a reviewer who wants a decisive verdict AND a rigorous audit. The
 full repository is checked out at the PR's head in your working directory, and
 the parts together cover the whole diff. Investigate before judging: read the
 complete functions around each hunk, grep for usages of changed symbols, check
-configs and i18n files and tests against the code. You have read-only tools
-(read/grep/glob); there is nothing to run or build. Do not modify any file.
+configs and i18n files and tests against the code, and confirm this part's
+changed behavior is covered by tests — an untested path is a finding. You have
+read-only tools (read/grep/glob); there is nothing to run or build. Do not
+modify any file. When unsure whether something in this part is a defect,
+choose "request_changes" — a false alarm costs one comment; a missed defect
+ships.
 
 Repository: {repo}
 Pull request: #{number} — {title}
