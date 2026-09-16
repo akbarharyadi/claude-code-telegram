@@ -164,6 +164,18 @@ Three modes:
 
 PRs in the queue are reviewed in parallel — up to `REVIEW_PARALLEL` at a time, and an oversized diff's parts overlap the same way — so a backlog of deep reviews takes as long as its slowest member, not the sum of all of them. Each verdict is still reported to Telegram the moment it lands.
 
+### What the reviewer sees besides the diff
+
+A diff-only review guesses; these give it evidence, each one switchable in `.env`:
+
+- **Stated intent** (`REVIEW_INCLUDE_BODY`, on) — the PR description rides in as a claim to check the diff against: does the change do what it says?
+- **CI status** (`REVIEW_INCLUDE_CHECKS`, on) — GitHub's checks for the exact head commit; a red build is named in the findings and never approved past.
+- **Trusted worktree checks** (`REVIEW_CHECK_COMMANDS`, off by default) — JSON `repo -> {label: argv}` commands (test suite, linters) that *we* run in the deep-mode worktree before the agent starts — the reviewer only reads their output; a failing suite is strong evidence of a defect.
+- **Round memory** (`REVIEW_REMEMBER_ROUNDS`, on) — on a re-review the reviewer sees its own previous findings and adjudicates them: fixed findings are closed, survivors are re-filed against the current code, instead of every round starting from scratch.
+- **Verification pass** (`REVIEW_VERIFY`, on) — before a request_changes is filed, a second pass re-checks each claimed defect against the code; claims that do not survive are dropped, and if all of them fall, the review is filed as a look-request instead of a block.
+- **Coverage gate** (`REVIEW_COVERAGE_GATE`, on) — an approval whose findings never mention some touched files is downgraded to a look-request: "cleared every hunk" becomes a checked claim, not an honor system (lockfiles and build artifacts are exempt; auto-approvals from the changes-limit are left alone).
+- **The review log** — every posted review appends one line to `state/review-log.jsonl` (verdict, sha, findings, cost) — the raw material for measuring false approves and false alarms once history accrues.
+
 ### Know what you are automating
 
 `gh pr review --approve` is not a comment. It is **your** approval: it satisfies CODEOWNERS, it can unblock branch protection, and to everyone else on the PR it looks exactly like you read the code and signed off.

@@ -77,6 +77,23 @@ def _int(value: str | None, default: int) -> int:
         return default
 
 
+def _json_object(value: str | None) -> dict:
+    """Parse a JSON object from the env; a bad value disables the feature
+    loudly rather than half-working."""
+    raw = _clean(value)
+    if not raw:
+        return {}
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        print(f"WARNING: env JSON is invalid, feature disabled: {exc}", file=sys.stderr)
+        return {}
+    if not isinstance(data, dict):
+        print("WARNING: env JSON must be an object, feature disabled", file=sys.stderr)
+        return {}
+    return data
+
+
 # ── Telegram ──────────────────────────────────────────────────────────────
 TELEGRAM_BOT_TOKEN = _clean(os.getenv("TELEGRAM_BOT_TOKEN"))
 ALLOWED_USER_IDS = _ints(os.getenv("ALLOWED_USER_IDS"))
@@ -323,12 +340,39 @@ REVIEW_POLL_SECONDS = _int(os.getenv("REVIEW_POLL_SECONDS"), 900)
 # 0 keeps the sweep manual (/reviews); anything else also runs it on the timer.
 REVIEW_WATCH = _bool(os.getenv("REVIEW_WATCH"), False)
 
+# ── review accuracy ───────────────────────────────────────────────────────
+# Evidence the reviewer gets beyond the diff itself. Each is a separate
+# switch so one noisy source can be muted without a redeploy.
+# The PR description, as stated intent to check the diff against.
+REVIEW_INCLUDE_BODY = _bool(os.getenv("REVIEW_INCLUDE_BODY"), True)
+# GitHub's check status (CI) for the PR head - a red build must not approve.
+REVIEW_INCLUDE_CHECKS = _bool(os.getenv("REVIEW_INCLUDE_CHECKS"), True)
+# On a re-review, show the reviewer its own previous findings so round 2
+# verifies fixes instead of starting from scratch.
+REVIEW_REMEMBER_ROUNDS = _bool(os.getenv("REVIEW_REMEMBER_ROUNDS"), True)
+# Downgrade approvals whose findings never mention some touched files -
+# "cleared every hunk" becomes a checked claim, not an honor system.
+REVIEW_COVERAGE_GATE = _bool(os.getenv("REVIEW_COVERAGE_GATE"), True)
+# Before filing request_changes, a second pass re-checks every claimed
+# defect against the code; claims that do not survive are dropped.
+REVIEW_VERIFY = _bool(os.getenv("REVIEW_VERIFY"), True)
+# Trusted commands run (never by the agent) in the deep-mode worktree and
+# handed to the reviewer as evidence: JSON mapping repo name -> {label: argv}.
+# Example:
+#   REVIEW_CHECK_COMMANDS={"Nexus-Backend": {"tests": ["npm", "run", "test"]}}
+# Empty disables the feature. Runs only when the repo is cloned (deep mode).
+REVIEW_CHECK_COMMANDS = _json_object(os.getenv("REVIEW_CHECK_COMMANDS"))
+REVIEW_CHECK_TIMEOUT = _int(os.getenv("REVIEW_CHECK_TIMEOUT"), 900)
+
 # ── Local state ───────────────────────────────────────────────────────────
 STATE_DIR = Path(_clean(os.getenv("STATE_DIR")) or (ROOT / "state"))
 DOWNLOAD_DIR = STATE_DIR / "downloads"
 SESSION_FILE = STATE_DIR / "sessions.json"
 INBOX_FILE = STATE_DIR / "inbox.jsonl"
 REVIEW_STATE_FILE = STATE_DIR / "reviews.json"
+# Every posted review appends one line here - the raw material for measuring
+# false approves and false alarms once history accrues.
+REVIEW_LOG_FILE = STATE_DIR / "review-log.jsonl"
 LOG_DIR = STATE_DIR / "logs"
 
 

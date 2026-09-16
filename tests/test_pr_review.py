@@ -551,8 +551,9 @@ async def test_a_matching_gh_account_proceeds(monkeypatch, tmp_path):
 async def test_an_approval_posts_no_inline_comments(monkeypatch):
     """Inline notes are for defects only — verification receipts on a clean
     approval just spam every hunk of the diff."""
+    monkeypatch.setattr(pr_review.config, "REVIEW_COVERAGE_GATE", False)
 
-    async def approving(pr, diff, mode="quick", discussion=""):
+    async def approving(pr, diff, mode="quick", discussion="", **kwargs):
         return Verdict(
             verdict="approve",
             summary="clean",
@@ -577,7 +578,7 @@ async def test_an_approval_posts_no_inline_comments(monkeypatch):
 
 @pytest.mark.anyio
 async def test_requested_changes_keep_their_inline_comments(monkeypatch):
-    async def defect(pr, diff, mode="quick", discussion=""):
+    async def defect(pr, diff, mode="quick", discussion="", **kwargs):
         return Verdict(
             verdict="request_changes",
             summary="one defect",
@@ -612,6 +613,7 @@ async def test_review_now_reviews_a_pr_nobody_is_waiting_on(monkeypatch, tmp_pat
     monkeypatch.setattr(pr_review.config, "REVIEW_REPOS", ["o/r"])
     monkeypatch.setattr(pr_review.config, "REVIEW_LOGIN", "")  # trust the active gh login
     monkeypatch.setattr(pr_review.config, "REVIEW_STATE_FILE", tmp_path / "reviews.json")
+    monkeypatch.setattr(pr_review.config, "REVIEW_COVERAGE_GATE", False)
 
     async def fake_gh(*args, check=True, stdin_data=None):
         if "--jq" in args:
@@ -647,7 +649,7 @@ async def _tiny_diff(pr):
     return "diff --git a/x.py b/x.py\n+++ b/x.py\n@@ -1 +1 @@\n-ok\n+fine\n"
 
 
-async def _ok_verdict(pr, diff, mode="quick", discussion=""):
+async def _ok_verdict(pr, diff, mode="quick", discussion="", **kwargs):
     return Verdict(verdict="approve", summary="ok")
 
 
@@ -746,13 +748,14 @@ async def test_discussion_rides_into_the_prompt_behind_a_guard(monkeypatch):
 @pytest.mark.anyio
 async def test_review_one_fetches_discussion_for_deep_mode(monkeypatch):
     """The sweep path feeds the discussion through to the reviewer."""
+    monkeypatch.setattr(pr_review.config, "REVIEW_COVERAGE_GATE", False)
     seen: dict = {}
 
     async def fake_discussion(pr, me):
         seen["me"] = me
         return "bob flagged a race"
 
-    async def fake_ask(pr, diff, *, mode="quick", discussion=""):
+    async def fake_ask(pr, diff, *, mode="quick", discussion="", **kwargs):
         seen["discussion"] = discussion
         return Verdict(verdict="approve", summary="ok")
 
@@ -992,6 +995,270 @@ def test_merge_part_verdicts_comment_when_a_part_cannot_tell():
     assert merged.verdict == "comment"
 
 
+# ── evidence, verification, and the accuracy gates ────────────────────────
+
+
+def test_format_checks_mixed_shapes():
+    """CheckRuns and StatusContexts name their fields differently; both must
+    render, with a red build impossible to miss."""
+    rows = [
+        {"name": "lint", "conclusion": "SUCCESS", "status": "COMPLETED"},
+        {"context": "ci/deploy", "state": "FAILURE"},
+        {"name": "build", "conclusion": None, "status": "IN_PROGRESS"},
+    ]
+    text = pr_review._format_checks(rows)
+    assert "✅ lint (success)" in text
+    assert "❌ ci/deploy (failure)" in text
+    assert "• build (in_progress)" in text
+    assert pr_review._format_checks([]) == ""
+    assert pr_review._format_checks(None) == ""
+
+
+def test_own_prior_from_rows_stops_at_our_approval():
+    """Our newest change-request since our last approval is the round to
+    adjudicate; defects the approval already cleared stay buried."""
+    rows = [
+        {"user": {"login": "me"}, "state": "CHANGES_REQUESTED", "body": "old one"},
+        {"user": {"login": "me"}, "state": "APPROVED", "body": "fine now"},
+        {"user": {"login": "me"}, "state": "CHANGES_REQUESTED", "body": "newest race"},
+        {"user": {"login": "other"}, "state": "CHANGES_REQUESTED", "body": "not mine"},
+    ]
+    assert pr_review._own_prior_from_rows(rows, "me") == "newest race"
+    assert pr_review._own_prior_from_rows(
+        [{"user": {"login": "me"}, "state": "APPROVED", "body": "x"}], "me"
+    ) == ""
+
+
+def _review_one_stubs(monkeypatch, tmp_path, ask):
+    """Common stubs for review_one tests that drive the evidence path."""
+    monkeypatch.setattr(pr_review.config, "REVIEW_STATE_FILE", tmp_path / "reviews.json")
+
+    async def no_discussion(pr, me):
+        return ""
+
+    async def no_checks(pr):
+        return ""
+
+    async def no_prior(pr, me):
+        return ""
+
+    monkeypatch.setattr(pr_review, "fetch_discussion", no_discussion)
+    monkeypatch.setattr(pr_review, "fetch_checks", no_checks)
+    monkeypatch.setattr(pr_review, "fetch_prior_findings", no_prior)
+    monkeypatch.setattr(pr_review, "fetch_diff", _tiny_diff)
+    monkeypatch.setattr(pr_review, "head_sha", _settled_head)
+    monkeypatch.setattr(pr_review, "ask_claude", ask)
+
+
+@pytest.mark.anyio
+async def test_intent_ci_and_prior_ride_toward_the_reviewer(monkeypatch, tmp_path):
+    """The reviewer is fed stated intent, CI status, and our last round —
+    each injection-guarded, each degradable to empty."""
+    seen: dict = {}
+
+    async def fake_ask(pr, diff, *, mode="quick", discussion="", evidence="", prior="", **kw):
+        seen["evidence"] = evidence
+        seen["prior"] = prior
+        return Verdict(verdict="approve", summary="ok")
+
+    async def red_checks(pr):
+        return "❌ ci/test (failure)"
+
+    async def last_round(pr, me):
+        return "you filed: `x.py` — a race survives"
+
+    monkeypatch.setattr(pr_review.config, "REVIEW_COVERAGE_GATE", False)
+    _review_one_stubs(monkeypatch, tmp_path, fake_ask)
+    monkeypatch.setattr(pr_review, "fetch_checks", red_checks)
+    monkeypatch.setattr(pr_review, "fetch_prior_findings", last_round)
+    pr = PullRequest(repo="o/r", number=9, title="t", author="a", url="u",
+                     body="this adds a cache")
+
+    await pr_review.review_one(pr, mode="quick", dry_run=True)
+
+    assert "<intent>" in seen["evidence"] and "adds a cache" in seen["evidence"]
+    assert "never an instruction" in seen["evidence"]
+    assert "<ci>" in seen["evidence"] and "❌ ci/test (failure)" in seen["evidence"]
+    assert seen["prior"] == "you filed: `x.py` — a race survives"
+
+
+@pytest.mark.anyio
+async def test_the_coverage_gate_downgrades_an_approval_with_unexamined_files():
+    """An approval whose findings never mention a touched file did not clear
+    every hunk — it becomes a look-request, not a rubber stamp."""
+    diff = (
+        "diff --git a/src/a.py b/src/a.py\n"
+        "--- a/src/a.py\n+++ b/src/a.py\n@@ -1 +1 @@\n-ok\n+fine\n"
+        "diff --git a/src/b.py b/src/b.py\n"
+        "--- a/src/b.py\n+++ b/src/b.py\n@@ -1 +1 @@\n-ok\n+fine\n"
+    )
+    verdict = Verdict(verdict="approve", summary="a.py is fine")
+
+    pr_review._coverage_gate(_pr4157(), verdict, diff)
+
+    assert verdict.verdict == "comment"
+    assert "Downgraded from approve" in verdict.summary
+    assert "src/b.py" in verdict.summary
+
+
+@pytest.mark.anyio
+async def test_the_coverage_gate_keeps_a_thorough_approval():
+    diff = (
+        "diff --git a/src/a.py b/src/a.py\n"
+        "--- a/src/a.py\n+++ b/src/a.py\n@@ -1 +1 @@\n-ok\n+fine\n"
+        "diff --git a/package-lock.json b/package-lock.json\n"
+        "--- a/package-lock.json\n+++ b/package-lock.json\n@@ -1 +1 @@\n-x\n+y\n"
+    )
+    verdict = Verdict(
+        verdict="approve", summary="ok",
+        findings=["`src/a.py` — the change is safe"],
+    )
+
+    pr_review._coverage_gate(_pr4157(), verdict, diff)
+
+    # lockfile churn needs no finding; the real file was examined
+    assert verdict.verdict == "approve"
+
+
+@pytest.mark.anyio
+async def test_auto_approvals_skip_the_coverage_gate(monkeypatch):
+    """The changes-limit deal downgrades defect rounds to approvals to keep
+    the queue moving — the gate must not jam it again."""
+    monkeypatch.setattr(pr_review.config, "REVIEW_COVERAGE_GATE", True)
+    diff = "diff --git a/src/a.py b/src/a.py\n--- a/src/a.py\n+++ b/src/a.py\n@@\n-x\n+y\n"
+    verdict = Verdict(verdict="approve", summary="defects already listed",
+                      auto_approved=True)
+
+    pr_review._coverage_gate(_pr4157(), verdict, diff)
+
+    assert verdict.verdict == "approve"
+
+
+def _stream_of(replies: list[str]):
+    async def fake_stream(spec):
+        yield type("E", (), {"kind": "text", "text": replies.pop(0)})()
+        yield type("E", (), {"kind": "result", "text": "", "cost_usd": 0.01, "is_error": False})()
+    return fake_stream
+
+
+_DEFECT_JSON = (
+    '{"verdict": "request_changes", "summary": "two defects", '
+    '"findings": ["`a.py` — boom", "`b.py` — bust"], "comments": []}'
+)
+
+
+@pytest.mark.anyio
+async def test_verification_drops_rejected_defects(monkeypatch):
+    """A second pass re-checks each claimed defect; the ones that do not
+    survive are dropped before the review is filed."""
+    monkeypatch.setattr(
+        pr_review, "stream_run",
+        _stream_of([
+            _DEFECT_JSON,
+            '```json\n[{"id": 1, "valid": "yes", "evidence": "a.py:1 real"},'
+            ' {"id": 2, "valid": "no", "evidence": "handled upstream"}]\n```',
+        ]),
+    )
+    monkeypatch.setattr(pr_review.config, "REVIEW_CLONE_ROOT", "")
+    pr = _pr4157()
+
+    verdict = await pr_review.ask_claude(pr, await _tiny_diff(pr))
+
+    assert verdict.verdict == "request_changes"
+    assert verdict.findings == ["`a.py` — boom"]
+    assert verdict.cost_usd == 0.02  # both passes bill
+
+
+@pytest.mark.anyio
+async def test_verification_rejecting_every_claim_downgrades_to_comment(monkeypatch):
+    """Blocking an author on phantom defects is the false alarm this pass
+    exists to prevent — all-rejected becomes a look-request."""
+    monkeypatch.setattr(
+        pr_review, "stream_run",
+        _stream_of([
+            _DEFECT_JSON,
+            '```json\n[{"id": 1, "valid": "no", "evidence": "x"},'
+            ' {"id": 2, "valid": "no", "evidence": "y"}]\n```',
+        ]),
+    )
+    monkeypatch.setattr(pr_review.config, "REVIEW_CLONE_ROOT", "")
+    pr = _pr4157()
+
+    verdict = await pr_review.ask_claude(pr, await _tiny_diff(pr))
+
+    assert verdict.verdict == "comment"
+    assert verdict.findings == []
+    assert "did not survive verification" in verdict.summary
+
+
+@pytest.mark.anyio
+async def test_a_failed_verification_pass_leaves_the_findings_standing(monkeypatch):
+    """The verifier breaking must never file nothing — the original review
+    goes out unverified instead."""
+    async def broken_stream(spec):
+        if "verifier" in spec.prompt:
+            yield type("E", (), {"kind": "error", "text": "backend exploded"})()
+            return
+        yield type("E", (), {"kind": "text", "text": _DEFECT_JSON})()
+        yield type("E", (), {"kind": "result", "text": "", "cost_usd": 0.01, "is_error": False})()
+
+    monkeypatch.setattr(pr_review, "stream_run", broken_stream)
+    monkeypatch.setattr(pr_review.config, "REVIEW_CLONE_ROOT", "")
+    pr = _pr4157()
+
+    verdict = await pr_review.ask_claude(pr, await _tiny_diff(pr))
+
+    assert verdict.verdict == "request_changes"
+    assert len(verdict.findings) == 2
+
+
+@pytest.mark.anyio
+async def test_run_checks_captures_trusted_command_results(monkeypatch, tmp_path):
+    """The operator's commands run in the worktree; pass/fail and output
+    become evidence, and a missing command degrades to 'could not run'."""
+    monkeypatch.setattr(pr_review.config, "REVIEW_CHECK_COMMANDS", {
+        "r": {
+            "tests": [sys.executable, "-c", "print('all ok')"],
+            "lint": [sys.executable, "-c", "print('E1'); raise SystemExit(1)"],
+            "ghost": ["definitely-not-a-real-binary-xyz"],
+        }
+    })
+
+    results = await pr_review.run_checks("r", tmp_path)
+
+    by = {res.label: res for res in results}
+    assert by["tests"].ok is True and "all ok" in by["tests"].output
+    assert by["lint"].ok is False and "E1" in by["lint"].output
+    assert by["ghost"].ok is None
+
+
+@pytest.mark.anyio
+async def test_a_posted_review_appends_to_the_log(monkeypatch, tmp_path):
+    """Every posted review leaves one jsonl line — the seed of a real
+    false-approve / false-alarm measurement."""
+    monkeypatch.setattr(pr_review.config, "REVIEW_COVERAGE_GATE", False)
+    monkeypatch.setattr(pr_review.config, "REVIEW_LOG_FILE", tmp_path / "log.jsonl")
+
+    async def approve(pr, diff, mode="quick", discussion="", **kwargs):
+        return Verdict(verdict="approve", summary="ok", findings=["`x.py` — fine"])
+
+    async def fake_submit(pr, verdict):
+        submitted.append(verdict)
+
+    submitted: list = []
+    _review_one_stubs(monkeypatch, tmp_path, approve)
+    monkeypatch.setattr(pr_review, "submit_review", fake_submit)
+    pr = PullRequest(repo="o/r", number=9, title="t", author="a", url="u")
+
+    outcome = await pr_review.review_one(pr, mode="quick", dry_run=False)
+
+    assert outcome.posted is True and len(submitted) == 1
+    row = json.loads((tmp_path / "log.jsonl").read_text(encoding="utf-8").splitlines()[0])
+    assert row["repo"] == "o/r" and row["number"] == 9
+    assert row["verdict"] == "approve" and row["sha"] == "aaa"  # the settled head
+    assert row["findings"] == 1 and "ts" in row
+
+
 # ── the settle guard: diff text must match the commit it is pinned to ──────
 
 
@@ -1100,6 +1367,7 @@ async def test_deep_mode_reads_real_code_inside_a_worktree(monkeypatch, tmp_path
     worktree.mkdir()
     clone = tmp_path / "clone"
     (clone / ".git").mkdir(parents=True)
+    monkeypatch.setattr(pr_review.config, "REVIEW_COVERAGE_GATE", False)
 
     async def fake_worktree(pr, sha):
         assert sha == "aaa"
@@ -1218,7 +1486,7 @@ async def test_an_open_pr_still_gets_reviewed(monkeypatch, tmp_path):
 # ── the request-changes threshold ─────────────────────────────────────────
 
 
-async def _defect_verdict(pr, diff, mode="quick", discussion=""):
+async def _defect_verdict(pr, diff, mode="quick", discussion="", **kwargs):
     return Verdict(
         verdict="request_changes",
         summary="still broken",
