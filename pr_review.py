@@ -789,20 +789,27 @@ async def ask_claude(
                 pr, diff, prompt, part=None, total=1, cwd=cwd, discussion=discussion
             )
         else:
-            parts: list[Verdict] = []
             chunks = _split_diff(diff, MAX_DIFF_CHARS)
             total = len(chunks)
-            cost = 0.0
             part_prompt = _DEEP_PART_PROMPT if worktree else _PART_PROMPT
-            for i, chunk in enumerate(chunks, 1):
-                part, part_cost = await _run_verdict(
-                    pr, chunk, part_prompt, part=i, total=total, cwd=cwd,
-                    discussion=discussion,
-                )
-                parts.append(part)
-                cost += part_cost
-            verdict = _merge_part_verdicts(parts)
-            verdict.cost_usd = cost
+            # Parts are independent, so they run at the same time — bounded by
+            # REVIEW_PARALLEL just like sibling PRs are in sweep(), so one
+            # oversized diff finishes in the time of its slowest part, not the
+            # sum of all of them.
+            gates = asyncio.Semaphore(max(1, config.REVIEW_PARALLEL))
+
+            async def run_part(i: int, chunk: str) -> tuple[Verdict, float]:
+                async with gates:
+                    return await _run_verdict(
+                        pr, chunk, part_prompt, part=i, total=total, cwd=cwd,
+                        discussion=discussion,
+                    )
+
+            pairs = await asyncio.gather(
+                *(run_part(i, chunk) for i, chunk in enumerate(chunks, 1))
+            )
+            verdict = _merge_part_verdicts([part for part, _ in pairs])
+            verdict.cost_usd = sum(cost for _, cost in pairs)
     finally:
         if worktree:
             await _drop_worktree(worktree, clone)
@@ -1099,8 +1106,11 @@ async def _repo_worktree(pr: PullRequest, sha: str) -> tuple[Path, Path] | None:
         return None
     worktree = Path(tempfile.mkdtemp(prefix=f"review-{pr.repo.split('/')[-1]}-"))
     try:
-        await _run_git(["fetch", "--quiet", "origin", f"refs/pull/{pr.number}/head"], clone)
-        await _run_git(["worktree", "add", "--detach", str(worktree), sha], clone)
+        async with _gate():
+            await _run_git(
+                ["fetch", "--quiet", "origin", f"refs/pull/{pr.number}/head"], clone
+            )
+            await _run_git(["worktree", "add", "--detach", str(worktree), sha], clone)
         log.info("deep review worktree ready at %s (%s)", worktree, sha[:10])
         return worktree, clone
     except Exception:  # noqa: BLE001 - diff-only is an acceptable fallback
@@ -1115,6 +1125,25 @@ async def _drop_worktree(worktree: Path, clone: Path) -> None:
         await _run_git(["worktree", "prune"], clone)
     except (ReviewError, RuntimeError):
         pass
+
+
+# Parallel deep reviews of one repo all fetch into the same clone. Git mostly
+# locks itself, but two fetches racing on packed-refs can still fail a worktree
+# — so the few seconds of fetch + worktree add run one at a time, while the
+# minutes of model reading that follow stay fully parallel. The lock binds to
+# the running loop lazily so a fresh event loop (tests, restarts) never meets
+# a stale one.
+_worktree_gate: asyncio.Lock | None = None
+_gate_loop: asyncio.AbstractEventLoop | None = None
+
+
+def _gate() -> asyncio.Lock:
+    global _worktree_gate, _gate_loop
+    loop = asyncio.get_running_loop()
+    if _worktree_gate is None or _gate_loop is not loop:
+        _worktree_gate = asyncio.Lock()
+        _gate_loop = loop
+    return _worktree_gate
 
 
 async def review_one(
@@ -1240,13 +1269,18 @@ async def sweep(
     force: bool = False,
     limit: int = 0,
     on_start=None,
+    on_outcome=None,
 ) -> list[Outcome]:
     """Review every PR waiting on you that we have not already handled.
 
+    Reviews run several at once — up to REVIEW_PARALLEL of them — so a
+    backlog takes as long as its slowest review, not the sum of all of them.
     `limit` caps how many get reviewed in one pass — mainly so a first run can
     be one PR rather than the whole backlog. `on_start`, when given, gets a
     heads-up message just before each review begins: deep reviews run for many
     minutes, and a phone with no heartbeat looks exactly like a dead watcher.
+    `on_outcome`, when given, gets each finished Outcome as it lands, so the
+    phone hears the first verdict while the rest are still running.
     """
     mode = _check_mode(mode)
 
@@ -1255,7 +1289,10 @@ async def sweep(
     pending = await find_pending(config.REVIEW_REPOS, me)
     seen = _load_seen()
     outcomes: list[Outcome] = []
+    todo: list[PullRequest] = []
 
+    # The cheap pass — drafts, heads we already reviewed, merged PRs — runs
+    # before anything is scheduled, so no model time is spent on a skip.
     for pr in pending:
         if pr.draft and config.REVIEW_SKIP_DRAFTS:
             continue
@@ -1266,25 +1303,47 @@ async def sweep(
             if await pr_merged(pr):
                 log.info("%s: merged/closed - skipping", pr.key)
                 continue
-            log.info("reviewing %s", pr.key)
-            if on_start is not None:
-                await _safe_report(on_start, start_line(pr))
-            outcome = await review_one(pr, mode=mode, dry_run=dry_run, me=me)
         except ReviewError as exc:
             outcomes.append(Outcome(pr=pr, error=str(exc)))
             continue
+        todo.append(pr)
+
+    if limit:
+        todo = todo[:limit]
+    if not todo:
+        return outcomes
+
+    slots = asyncio.Semaphore(max(1, config.REVIEW_PARALLEL))
+    seen_lock = asyncio.Lock()
+
+    async def one(pr: PullRequest) -> Outcome:
+        log.info("reviewing %s", pr.key)
+        if on_start is not None:
+            await _safe_report(on_start, start_line(pr))
+        try:
+            outcome = await review_one(pr, mode=mode, dry_run=dry_run, me=me)
+        except ReviewError as exc:
+            outcome = Outcome(pr=pr, error=str(exc))
         except Exception as exc:  # noqa: BLE001 — one bad PR must not end the sweep
-            outcomes.append(Outcome(pr=pr, error=f"{type(exc).__name__}: {exc}"))
-            continue
-
-        outcomes.append(outcome)
+            outcome = Outcome(pr=pr, error=f"{type(exc).__name__}: {exc}")
         if outcome.posted:
-            seen[pr.key] = pr.head_sha
-            _save_seen(seen)
+            # Re-read under the lock: sibling workers saved their heads in the
+            # meantime, and a blind write would drop them.
+            async with seen_lock:
+                seen_now = _load_seen()
+                seen_now[pr.key] = pr.head_sha
+                _save_seen(seen_now)
+        if on_outcome is not None:
+            await _safe_report(on_outcome, outcome)
+        return outcome
 
-        if limit and len([o for o in outcomes if not o.error]) >= limit:
-            break
+    async def bounded(pr: PullRequest) -> Outcome:
+        async with slots:
+            return await one(pr)
 
+    # gather() keeps argument order, so callers still see outcomes in queue
+    # order even though the reviews finished whenever each finished.
+    outcomes.extend(await asyncio.gather(*(bounded(pr) for pr in todo)))
     return outcomes
 
 
@@ -1366,19 +1425,23 @@ async def _safe_report(on_report, text: str) -> None:
 
 async def watch(on_report) -> None:
     """Sweep on a timer forever, calling `on_report(text)` when something happened."""
+
+    async def on_outcome(out: Outcome) -> None:
+        if out.error:
+            log.warning("%s: %s", out.pr.key, out.error)
+        elif out.posted:
+            log.info("%s: posted %s", out.pr.key, out.verdict.verdict)
+        # Report each review as it lands - a batch at the end of a long
+        # sweep dies with the process and the owner sees nothing. In a
+        # parallel sweep this is also what keeps reports from waiting on
+        # the slowest PR in the queue.
+        if out.posted or out.error:
+            await _safe_report(on_report, summarize([out]))
+
     while True:
         try:
             log.info("review sweep starting (mode=%s)", config.REVIEW_MODE)
-            outcomes = await sweep(on_start=on_report)
-            for out in outcomes:
-                if out.error:
-                    log.warning("%s: %s", out.pr.key, out.error)
-                elif out.posted:
-                    log.info("%s: posted %s", out.pr.key, out.verdict.verdict)
-                # Report each review as it lands - a batch at the end of a long
-                # sweep dies with the process and the owner sees nothing.
-                if out.posted or out.error:
-                    await _safe_report(on_report, summarize([out]))
+            await sweep(on_start=on_report, on_outcome=on_outcome)
         except ReviewError as exc:
             log.warning("review sweep failed: %s", exc)
             await _safe_report(on_report, f"?? Review sweep failed: {exc}")

@@ -6,6 +6,7 @@ when only part of the diff was read."""
 
 from __future__ import annotations
 
+import asyncio
 import json
 import sys
 from pathlib import Path
@@ -267,6 +268,44 @@ async def test_an_oversized_diff_is_reviewed_in_parts_and_stays_decisive(monkeyp
     assert len(seen_prompts) == 2
     assert "1 of 2" in seen_prompts[0] and "2 of 2" in seen_prompts[1]
     assert "Reviewed in 2 parts" in verdict.summary
+
+
+@pytest.mark.anyio
+async def test_an_oversized_diffs_parts_run_in_parallel(monkeypatch):
+    """Part reviews are independent model runs, so they overlap — a huge PR
+    costs its slowest part's latency, not the sum of every part."""
+    active = 0
+    peak = 0
+
+    async def fake_stream(spec):
+        nonlocal active, peak
+        active += 1
+        peak = max(peak, active)
+        await asyncio.sleep(0.05)
+        active -= 1
+        part = "1" if "1 of 2" in spec.prompt else "2"
+        yield type(
+            "E",
+            (),
+            {
+                "kind": "text",
+                "text": '{"verdict": "approve", "summary": "part ' + part + ' clean"}',
+            },
+        )()
+        yield type(
+            "E", (), {"kind": "result", "text": "", "cost_usd": 0.01, "is_error": False}
+        )()
+
+    monkeypatch.setattr(pr_review, "stream_run", fake_stream)
+    monkeypatch.setattr(pr_review, "MAX_DIFF_CHARS", 4_000)
+    monkeypatch.setattr(pr_review.config, "REVIEW_PARALLEL", 2)
+    pr = PullRequest(repo="o/r", number=1, title="t", author="someone", url="u")
+
+    diff = _file_patch("a.py", 150) + _file_patch("b.py", 150)
+    verdict = await pr_review.ask_claude(pr, diff)
+
+    assert peak == 2  # sequential behavior peaks at 1
+    assert verdict.verdict == "approve"
 
 
 @pytest.mark.anyio
@@ -773,6 +812,115 @@ async def test_the_sweep_reports_when_a_review_starts(monkeypatch, tmp_path):
     assert len(started) == 2
     assert "o/r#11" in started[0] and "the race" in started[0]
     assert started[0].startswith("🔍")
+
+
+# ── parallel sweeps ───────────────────────────────────────────────────────
+
+
+def _sweep_mocks(monkeypatch, tmp_path, numbers):
+    """Standard stubs for sweep tests: one repo, N pending PRs, all open."""
+    monkeypatch.setattr(pr_review.config, "REVIEW_REPOS", ["o/r"])
+    monkeypatch.setattr(pr_review.config, "REVIEW_LOGIN", "work-account")
+    monkeypatch.setattr(pr_review.config, "REVIEW_STATE_FILE", tmp_path / "reviews.json")
+
+    async def fake_whoami():
+        return "work-account"
+
+    async def fake_pending(repos, me):
+        return [
+            PullRequest(repo="o/r", number=n, title="t", author="someone", url="u")
+            for n in numbers
+        ]
+
+    async def fake_head_sha(pr):
+        return f"sha-{pr.number}"
+
+    async def not_merged(*args, **kwargs):
+        return False
+
+    monkeypatch.setattr(pr_review, "whoami", fake_whoami)
+    monkeypatch.setattr(pr_review, "find_pending", fake_pending)
+    monkeypatch.setattr(pr_review, "head_sha", fake_head_sha)
+    monkeypatch.setattr(pr_review, "pr_merged", not_merged)
+
+
+@pytest.mark.anyio
+async def test_a_backlog_is_reviewed_in_parallel(monkeypatch, tmp_path):
+    """Three waiting PRs are reviewed at the same time, and the sweep still
+    reports outcomes in queue order even though they finished out of order."""
+    _sweep_mocks(monkeypatch, tmp_path, [1, 2, 3])
+    monkeypatch.setattr(pr_review.config, "REVIEW_PARALLEL", 3)
+
+    active = 0
+    peak = 0
+
+    async def fake_review_one(pr, *, mode, dry_run, me=""):
+        nonlocal active, peak
+        active += 1
+        peak = max(peak, active)
+        await asyncio.sleep(0.05)
+        active -= 1
+        return pr_review.Outcome(
+            pr=pr, verdict=Verdict(verdict="approve", summary=f"p{pr.number}"),
+            posted=True,
+        )
+
+    monkeypatch.setattr(pr_review, "review_one", fake_review_one)
+
+    outcomes = await pr_review.sweep(mode="quick", dry_run=True)
+
+    assert peak == 3  # the old one-at-a-time sweep peaks at 1
+    assert [o.pr.number for o in outcomes] == [1, 2, 3]
+    state = json.loads((tmp_path / "reviews.json").read_text(encoding="utf-8"))
+    assert state == {"o/r#1": "sha-1", "o/r#2": "sha-2", "o/r#3": "sha-3"}
+
+
+@pytest.mark.anyio
+async def test_review_parallel_caps_the_fan_out(monkeypatch, tmp_path):
+    """REVIEW_PARALLEL bounds the fan-out: two slots, three PRs, never more
+    than two reviews in flight."""
+    _sweep_mocks(monkeypatch, tmp_path, [1, 2, 3])
+    monkeypatch.setattr(pr_review.config, "REVIEW_PARALLEL", 2)
+
+    active = 0
+    peak = 0
+
+    async def fake_review_one(pr, *, mode, dry_run, me=""):
+        nonlocal active, peak
+        active += 1
+        peak = max(peak, active)
+        await asyncio.sleep(0.05)
+        active -= 1
+        return pr_review.Outcome(pr=pr, verdict=Verdict(verdict="approve"), posted=False)
+
+    monkeypatch.setattr(pr_review, "review_one", fake_review_one)
+
+    await pr_review.sweep(mode="quick", dry_run=True)
+
+    assert peak == 2
+
+
+@pytest.mark.anyio
+async def test_the_sweep_hands_each_outcome_to_on_outcome(monkeypatch, tmp_path):
+    """Reporting stays per-review: whoever finishes first is reported first,
+    instead of every verdict waiting on the slowest PR in the batch."""
+    _sweep_mocks(monkeypatch, tmp_path, [1, 2])
+    monkeypatch.setattr(pr_review.config, "REVIEW_PARALLEL", 2)
+
+    async def fake_review_one(pr, *, mode, dry_run, me=""):
+        await asyncio.sleep(0.01 if pr.number == 1 else 0.06)
+        return pr_review.Outcome(pr=pr, verdict=Verdict(verdict="approve"), posted=True)
+
+    landed: list[int] = []
+
+    async def on_outcome(out):
+        landed.append(out.pr.number)
+
+    monkeypatch.setattr(pr_review, "review_one", fake_review_one)
+
+    await pr_review.sweep(mode="quick", dry_run=True, on_outcome=on_outcome)
+
+    assert landed == [1, 2]
 
 
 # ── chunked review of oversized diffs ─────────────────────────────────────

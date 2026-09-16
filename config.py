@@ -315,6 +315,10 @@ REVIEW_SKIP_DRAFTS = _bool(os.getenv("REVIEW_SKIP_DRAFTS"), True)
 # 0 disables the cap.
 REVIEW_CHANGES_LIMIT = _int(os.getenv("REVIEW_CHANGES_LIMIT"), 2)
 REVIEW_TIMEOUT_SECONDS = _int(os.getenv("REVIEW_TIMEOUT_SECONDS"), 600)
+# How many reviews (or diff parts of one oversized review) run at the same
+# time. A backlog then takes as long as its slowest review, not the sum of
+# all of them. 1 restores the old one-at-a-time sweep.
+REVIEW_PARALLEL = _int(os.getenv("REVIEW_PARALLEL"), 3)
 REVIEW_POLL_SECONDS = _int(os.getenv("REVIEW_POLL_SECONDS"), 900)
 # 0 keeps the sweep manual (/reviews); anything else also runs it on the timer.
 REVIEW_WATCH = _bool(os.getenv("REVIEW_WATCH"), False)
