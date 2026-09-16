@@ -240,6 +240,7 @@ def test_deep_review_carries_a_meta_strip():
 async def test_an_oversized_diff_is_reviewed_in_parts_and_stays_decisive(monkeypatch):
     """Chunking covers the whole diff, so a big PR can still be approved —
     no downgrade to 'comment' just because it is big."""
+    monkeypatch.setattr(pr_review.config, "REVIEW_COVERAGE_GATE", False)
     seen_prompts: list[str] = []
 
     async def fake_stream(spec):
@@ -299,6 +300,7 @@ async def test_an_oversized_diffs_parts_run_in_parallel(monkeypatch):
     monkeypatch.setattr(pr_review, "stream_run", fake_stream)
     monkeypatch.setattr(pr_review, "MAX_DIFF_CHARS", 4_000)
     monkeypatch.setattr(pr_review.config, "REVIEW_PARALLEL", 2)
+    monkeypatch.setattr(pr_review.config, "REVIEW_COVERAGE_GATE", False)
     pr = PullRequest(repo="o/r", number=1, title="t", author="someone", url="u")
 
     diff = _file_patch("a.py", 150) + _file_patch("b.py", 150)
@@ -421,9 +423,10 @@ def test_summarize_compacts_instead_of_pasting_the_review():
 
 
 @pytest.mark.anyio
-async def test_an_oversized_diff_comments_instead_of_approving(monkeypatch):
+async def test_an_oversized_diff_requests_changes_instead_of_approving(monkeypatch):
     """GitHub caps its diff API at 20,000 lines. A change that big is exactly
-    the kind a skim must not wave through."""
+    the kind a skim must not wave through — binary policy: request_changes,
+    and it must never be auto-approved at the round limit."""
 
     async def too_big(*args, **kwargs):
         raise pr_review.DiffTooLarge("HTTP 406: Sorry, the diff exceeded the maximum")
@@ -443,8 +446,9 @@ async def test_an_oversized_diff_comments_instead_of_approving(monkeypatch):
     outcome = await pr_review.review_one(pr, mode="quick", dry_run=True)
 
     assert outcome.verdict is not None
-    assert outcome.verdict.verdict == "comment"
+    assert outcome.verdict.verdict == "request_changes"
     assert "needs a person" in outcome.verdict.summary
+    assert outcome.verdict.needs_human is True
 
 
 @pytest.mark.anyio
@@ -986,13 +990,14 @@ def test_merge_part_verdicts_request_changes_wins():
     assert merged.findings == ["defect"]
 
 
-def test_merge_part_verdicts_comment_when_a_part_cannot_tell():
+def test_merge_part_verdicts_a_part_that_cannot_tell_asks_for_changes():
     parts = [
         Verdict(verdict="approve", summary="ok"),
         Verdict(verdict="comment", summary="unclear"),
     ]
     merged = pr_review._merge_part_verdicts(parts)
-    assert merged.verdict == "comment"
+    # binary policy: a part the reviewer could not tell is not an approval
+    assert merged.verdict == "request_changes"
 
 
 # ── evidence, verification, and the accuracy gates ────────────────────────
@@ -1083,9 +1088,16 @@ async def test_intent_ci_and_prior_ride_toward_the_reviewer(monkeypatch, tmp_pat
 
 
 @pytest.mark.anyio
-async def test_the_coverage_gate_downgrades_an_approval_with_unexamined_files():
+async def test_the_coverage_gate_files_request_changes_when_the_gap_survives(monkeypatch):
     """An approval whose findings never mention a touched file did not clear
-    every hunk — it becomes a look-request, not a rubber stamp."""
+    every hunk. The remediation pass gets one shot; when it does not close
+    the gap, binary policy files request_changes — never a comment."""
+    monkeypatch.setattr(pr_review.config, "REVIEW_COVERAGE_GATE", True)
+
+    async def no_help(pr, verdict, missed, cwd=None, diff=""):
+        pass  # the reviewer adds nothing for the skipped files
+
+    monkeypatch.setattr(pr_review, "_remediate_coverage", no_help)
     diff = (
         "diff --git a/src/a.py b/src/a.py\n"
         "--- a/src/a.py\n+++ b/src/a.py\n@@ -1 +1 @@\n-ok\n+fine\n"
@@ -1094,11 +1106,35 @@ async def test_the_coverage_gate_downgrades_an_approval_with_unexamined_files():
     )
     verdict = Verdict(verdict="approve", summary="a.py is fine")
 
-    pr_review._coverage_gate(_pr4157(), verdict, diff)
+    await pr_review._coverage_gate(_pr4157(), verdict, diff)
 
-    assert verdict.verdict == "comment"
-    assert "Downgraded from approve" in verdict.summary
+    assert verdict.verdict == "request_changes"
+    assert "could not clear every hunk" in verdict.summary
     assert "src/b.py" in verdict.summary
+
+
+@pytest.mark.anyio
+async def test_the_coverage_gate_closes_the_gap_and_stays_an_approval(monkeypatch):
+    """One focused pass over exactly the skipped files; when it examines
+    them, the original approval stands."""
+    monkeypatch.setattr(pr_review.config, "REVIEW_COVERAGE_GATE", True)
+
+    async def remediate(pr, verdict, missed, cwd=None, diff=""):
+        assert missed == ["src/b.py"]
+        verdict.findings.append("`src/b.py` — verified the window bounds")
+
+    monkeypatch.setattr(pr_review, "_remediate_coverage", remediate)
+    diff = (
+        "diff --git a/src/a.py b/src/a.py\n"
+        "--- a/src/a.py\n+++ b/src/a.py\n@@ -1 +1 @@\n-ok\n+fine\n"
+        "diff --git a/src/b.py b/src/b.py\n"
+        "--- a/src/b.py\n+++ b/src/b.py\n@@ -1 +1 @@\n-ok\n+fine\n"
+    )
+    verdict = Verdict(verdict="approve", summary="a.py is fine")
+
+    await pr_review._coverage_gate(_pr4157(), verdict, diff)
+
+    assert verdict.verdict == "approve"
 
 
 @pytest.mark.anyio
@@ -1114,7 +1150,7 @@ async def test_the_coverage_gate_keeps_a_thorough_approval():
         findings=["`src/a.py` — the change is safe"],
     )
 
-    pr_review._coverage_gate(_pr4157(), verdict, diff)
+    await pr_review._coverage_gate(_pr4157(), verdict, diff)
 
     # lockfile churn needs no finding; the real file was examined
     assert verdict.verdict == "approve"
@@ -1129,9 +1165,30 @@ async def test_auto_approvals_skip_the_coverage_gate(monkeypatch):
     verdict = Verdict(verdict="approve", summary="defects already listed",
                       auto_approved=True)
 
-    pr_review._coverage_gate(_pr4157(), verdict, diff)
+    await pr_review._coverage_gate(_pr4157(), verdict, diff)
 
     assert verdict.verdict == "approve"
+
+
+@pytest.mark.anyio
+async def test_a_comment_verdict_from_the_model_becomes_request_changes(monkeypatch):
+    """Binary policy: the model's 'I cannot tell' is a request for changes,
+    with the reason in the summary — never a fence-sitting comment."""
+    monkeypatch.setattr(
+        pr_review, "stream_run",
+        _stream_of([
+            '{"verdict": "comment", "summary": "the diff references code that is not shown",'
+            ' "findings": [], "comments": []}',
+        ]),
+    )
+    monkeypatch.setattr(pr_review.config, "REVIEW_COVERAGE_GATE", False)
+    monkeypatch.setattr(pr_review.config, "REVIEW_CLONE_ROOT", "")
+    pr = _pr4157()
+
+    verdict = await pr_review.ask_claude(pr, await _tiny_diff(pr))
+
+    assert verdict.verdict == "request_changes"
+    assert "could not fully verify" in verdict.summary
 
 
 def _stream_of(replies: list[str]):
@@ -1170,9 +1227,9 @@ async def test_verification_drops_rejected_defects(monkeypatch):
 
 
 @pytest.mark.anyio
-async def test_verification_rejecting_every_claim_downgrades_to_comment(monkeypatch):
-    """Blocking an author on phantom defects is the false alarm this pass
-    exists to prevent — all-rejected becomes a look-request."""
+async def test_verification_rejecting_every_claim_stays_decisive(monkeypatch):
+    """All-rejected means the review could not positively clear the change —
+    binary policy keeps it at request_changes, saying why, never a comment."""
     monkeypatch.setattr(
         pr_review, "stream_run",
         _stream_of([
@@ -1186,9 +1243,30 @@ async def test_verification_rejecting_every_claim_downgrades_to_comment(monkeypa
 
     verdict = await pr_review.ask_claude(pr, await _tiny_diff(pr))
 
-    assert verdict.verdict == "comment"
+    assert verdict.verdict == "request_changes"
     assert verdict.findings == []
     assert "did not survive verification" in verdict.summary
+
+
+@pytest.mark.anyio
+async def test_the_gate_remediation_recovers_an_approval(monkeypatch):
+    """End to end: approve with an uncovered file -> remediation examines it
+    -> the approval stands with the new finding attached."""
+    monkeypatch.setattr(
+        pr_review, "stream_run",
+        _stream_of([
+            '{"verdict": "approve", "summary": "looks fine", "findings": [], "comments": []}',
+            '{"findings": ["`x.py` — verified the cap logic against the contract"]}',
+        ]),
+    )
+    monkeypatch.setattr(pr_review.config, "REVIEW_CLONE_ROOT", "")
+    pr = _pr4157()
+
+    verdict = await pr_review.ask_claude(pr, await _tiny_diff(pr))
+
+    assert verdict.verdict == "approve"
+    assert verdict.findings == ["`x.py` — verified the cap logic against the contract"]
+    assert verdict.cost_usd == 0.02
 
 
 @pytest.mark.anyio
@@ -1349,6 +1427,7 @@ def _approve_stream(capture: list):
 @pytest.mark.anyio
 async def test_deep_mode_without_a_clone_falls_back_to_diff_only(monkeypatch):
     monkeypatch.setattr(pr_review.config, "REVIEW_CLONE_ROOT", "")
+    monkeypatch.setattr(pr_review.config, "REVIEW_COVERAGE_GATE", False)
     capture: list = []
     monkeypatch.setattr(pr_review, "stream_run", _approve_stream(capture))
     pr = _pr4157()

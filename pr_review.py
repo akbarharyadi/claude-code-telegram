@@ -86,7 +86,7 @@ class LineComment:
 
 @dataclass(slots=True)
 class Verdict:
-    verdict: str  # one of _VERDICTS
+    verdict: str  # approve or request_changes — comment is parsed but never filed
     summary: str = ""
     findings: list[str] = field(default_factory=list)
     comments: list[LineComment] = field(default_factory=list)
@@ -94,6 +94,7 @@ class Verdict:
     cost_usd: float = 0.0
     deep: bool = False  # True when the repo itself was checked out and read
     auto_approved: bool = False  # request_changes downgraded at the round limit
+    needs_human: bool = False  # unreviewable (e.g. oversized diff) — never auto-approve it
 
 
 # ── talking to gh ─────────────────────────────────────────────────────────
@@ -766,14 +767,15 @@ cross-file breakage, a missing piece, an architecture problem — stays out of
 - never invent a path or line number — anything that does not anchor to the
   diff gets dropped, and one wrong anchor can void the whole review.
 
-Choosing the verdict:
+Choosing the verdict — there is no third verdict: a review either clears
+the change or asks for changes:
 - "approve" — you found no correctness, security, or data-loss defect. Style
   nits and preferences are NOT a reason to withhold approval; mention them as
   optional follow-ups in "findings" instead.
 - "request_changes" — you can name a concrete defect, with the file and what
-  breaks. Put one bullet per defect in "findings".
-- "comment" — the diff is truncated, or you genuinely cannot tell. Say why in
-  "summary".
+  breaks. Put one bullet per defect in "findings". Also choose this when the
+  diff is truncated or you genuinely cannot verify part of the change — say
+  exactly what you could not verify in "summary".
 
 Default to "request_changes" whenever a plausible defect survived your
 checks — do not give the change the benefit of the doubt. This reviewer
@@ -808,12 +810,13 @@ Reply with ONLY a fenced json block and nothing else:
    "body": "<note for that exact line>"}}]}}
 ```
 
-Verdict rules for ONE part:
+Verdict rules for ONE part — there is no third verdict; a part is either
+cleared or it asks for changes:
 - "approve" — nothing in THIS part is a correctness, security, or data-loss
   defect. Never withhold approval because you have not seen the other parts.
 - "request_changes" — you can name a concrete defect in this part, with the
-  file and what breaks.
-- "comment" — this part alone is unintelligible. Say why in "summary".
+  file and what breaks; also when this part alone is unintelligible — say
+  why in "summary".
 
 The "summary" field — 2-4 short sentences naming the files in this part and the
 one thing you verified about each. The "findings" field — one bullet per
@@ -884,13 +887,14 @@ only genuinely unanchorable defects (cross-file, architecture) stay out. Never
 invent a path or line number — unanchorable notes get dropped and one wrong
 anchor can void the whole review, so when in doubt leave it in "findings".
 
-Choosing the verdict:
+Choosing the verdict — there is no third verdict: a review either clears
+the change or asks for changes:
 - "approve" — no correctness, security, or data-loss defect survived your
   investigation. Style nits are NOT a reason to withhold approval.
 - "request_changes" — you can name a concrete defect, with the file and what
-  breaks; order findings worst first.
-- "comment" — you genuinely cannot tell (e.g. the diff references code that
-  does not exist in the checkout). Say what is missing in "summary".
+  breaks; order findings worst first. Also when the diff references code
+  that does not exist in the checkout, or you cannot verify part of the
+  change — say exactly what is missing in "summary".
 
 Default to "request_changes" whenever a plausible defect survived your
 checks — do not give the change the benefit of the doubt. This reviewer
@@ -931,12 +935,13 @@ Reply with ONLY a fenced json block and nothing else:
    "body": "<note for that exact line>"}}]}}
 ```
 
-Verdict rules for ONE part:
+Verdict rules for ONE part — there is no third verdict; a part is either
+cleared or it asks for changes:
 - "approve" — nothing in THIS part is a correctness, security, or data-loss
   defect. Never withhold approval because you have not seen the other parts.
 - "request_changes" — you can name a concrete defect in this part, with the
-  file and what breaks.
-- "comment" — this part alone is unintelligible. Say why in "summary".
+  file and what breaks; also when this part alone is unintelligible — say
+  why in "summary".
 
 The "summary" field — 2-3 short sentences on what this part does and what you
 verified. The "findings" field — one bullet per touched file or logical theme
@@ -1060,18 +1065,35 @@ async def ask_claude(
         # Claimed defects get a second opinion before they block an author:
         # a hallucinated finding is worse than a missed one, because it is
         # visible, wrong, and erodes trust in every review after it.
+        if verdict.verdict == "comment":
+            # Binary policy: a review either clears the change or asks for
+            # changes. "Could not verify" IS a request for changes.
+            _force_decisive(verdict)
         if (
             config.REVIEW_VERIFY
             and verdict.verdict == "request_changes"
             and verdict.findings
         ):
             await _verify_findings(pr, verdict, diff=diff, cwd=cwd)
+        await _coverage_gate(pr, verdict, diff, cwd=cwd)
     finally:
         if worktree:
             await _drop_worktree(worktree, clone)
 
     verdict.deep = bool(worktree)
     return verdict
+
+
+def _force_decisive(verdict: Verdict) -> None:
+    """Map the model's 'I cannot tell' to request_changes, with the reason
+    in the summary. Never silent: the author must see what was unverified."""
+    if verdict.verdict != "comment":
+        return
+    verdict.verdict = "request_changes"
+    verdict.summary = (
+        "Filed as request_changes: the review could not fully verify this "
+        "change. " + verdict.summary
+    )[:1200]
 
 
 async def _run_verdict(
@@ -1265,14 +1287,16 @@ async def _verify_findings(
     )
     verdict.findings = kept
     if not kept:
-        # Every claim was rejected: blocking the author on phantom defects
-        # is exactly the false alarm this pass exists to prevent.
-        verdict.verdict = "comment"
+        # Every claim was rejected — but the first pass still saw something
+        # it could not clear. Binary policy: not confident enough to approve
+        # means request_changes, with the disagreement stated plainly.
         verdict.comments = []
         verdict.summary = (
             f"(All {dropped} claimed defect(s) from the first pass did not "
-            "survive verification, so this is filed as a look-request rather "
-            "than a block.) " + verdict.summary
+            "survive verification. Filed as request_changes anyway: the "
+            "review could not positively clear the change — a human should "
+            "confirm. Dismiss this review if the change is obviously fine.) "
+            + verdict.summary
         )[:1200]
 
 
@@ -1319,15 +1343,15 @@ def _split_diff(diff: str, max_chars: int) -> list[str]:
 
 
 def _merge_part_verdicts(parts: list[Verdict]) -> Verdict:
-    """Fold per-part verdicts into one. Full coverage means a decisive verdict:
-    approve only when every part approved, request_changes wins over anything."""
+    """Fold per-part verdicts into one. Full coverage means a decisive
+    verdict: approve only when every part approved, request_changes wins over
+    anything — including a part that could not tell. There is no third
+    verdict: a review either clears the change or asks for changes."""
     if not parts:
         raise ReviewError("no verdict parts to merge")
     verdict = "approve"
-    if any(p.verdict == "request_changes" for p in parts):
+    if any(p.verdict != "approve" for p in parts):
         verdict = "request_changes"
-    elif any(p.verdict != "approve" for p in parts):
-        verdict = "comment"
 
     summary = " ".join(p.summary for p in parts if p.summary)
     if len(parts) > 1:
@@ -1587,13 +1611,17 @@ def _uncovered_files(diff: str, verdict: Verdict) -> list[str]:
     return missed
 
 
-def _coverage_gate(pr: PullRequest, verdict: Verdict, diff: str) -> None:
+async def _coverage_gate(
+    pr: PullRequest, verdict: Verdict, diff: str, cwd: Path | None = None
+) -> None:
     """An approval claims every hunk was cleared — check the claim.
 
-    Files the findings never mention were not cleared, so the verdict
-    becomes a look-request instead of a rubber stamp. Auto-approvals are
-    exempt: the changes-limit deal exists to keep the queue moving, and
-    downgrading those back to comments would jam it again.
+    Files the findings never mention were not cleared. First the reviewer
+    gets one focused remediation pass to actually examine exactly those
+    files; if the gap closes, the approval stands. If it does not, binary
+    policy applies: the verdict becomes request_changes naming the files,
+    never a fence-sitting comment. Auto-approvals from the changes-limit
+    are exempt — that deal exists to keep the queue moving.
     """
     if not config.REVIEW_COVERAGE_GATE or verdict.verdict != "approve" or verdict.unread:
         return
@@ -1602,20 +1630,132 @@ def _coverage_gate(pr: PullRequest, verdict: Verdict, diff: str) -> None:
     missed = _uncovered_files(diff, verdict)
     if not missed:
         return
-    shown = ", ".join(f"`{p}`" for p in missed[:5])
-    if len(missed) > 5:
-        shown += f" …{len(missed) - 5} more"
     log.info(
         "%s: coverage gate — %d touched file(s) never examined: %s",
         pr.key, len(missed), ", ".join(missed),
     )
-    verdict.verdict = "comment"
+    await _remediate_coverage(pr, verdict, missed, cwd=cwd, diff=diff)
+    still_missed = _uncovered_files(diff, verdict)
+    if not still_missed:
+        log.info("%s: coverage gate closed by the remediation pass", pr.key)
+        return
+    shown = ", ".join(f"`{p}`" for p in still_missed[:5])
+    if len(still_missed) > 5:
+        shown += f" …{len(still_missed) - 5} more"
+    verdict.verdict = "request_changes"
     verdict.summary = (
-        f"Downgraded from approve: {len(missed)} touched file(s) were never "
-        f"examined in the findings ({shown}). The review could not clear "
-        "every hunk, so this needs a human look rather than a stamp. "
-        + verdict.summary
+        f"Requesting changes because the review could not clear every hunk: "
+        f"{len(still_missed)} touched file(s) were never examined ({shown}). "
+        "A human should look at them before this merges. " + verdict.summary
     )[:1200]
+
+
+_REMEDIATE_PROMPT = """\
+You are finishing your review of pull request #{number} of {repo}. Your
+verdict so far was "approve", but the coverage check found touched files your
+findings never mentioned — an approval must clear every hunk. {where}
+
+The files you did not cover:
+
+{files}
+
+For each file, in order: examine it and add exactly one finding:
+- If it is fine, the finding says what you verified about it — standard
+  format: `path` — one sentence on what you checked and why it is safe.
+- If it holds a defect, the finding says what breaks and where.
+- Only if you genuinely cannot verify it, say so explicitly in that finding.
+Do not re-review the files you already covered.
+
+{diff_block}Reply with ONLY a fenced json object and nothing else:
+```json
+{{"findings": ["`frontend/lib/x.ts` — verified the new window bounds match the server contract"]}}
+```
+"""
+
+
+def _remediate_where(cwd: Path | None) -> str:
+    if cwd is not None:
+        return (
+            "The full repository is checked out at the PR's head in your "
+            "working directory — read the files; read-only tools only, do "
+            "not modify anything."
+        )
+    return (
+        "You have no tools and no checkout — judge each file from the diff "
+        "you already reviewed, and say so when that is not enough."
+    )
+
+
+def _parse_findings_reply(text: str) -> list[str]:
+    """Pull the findings array out of the remediation reply."""
+    block = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.S)
+    raw = block.group(1) if block else None
+    if raw is None:
+        brace = re.search(r"(\{.*\})", text, re.S)
+        raw = brace.group(1) if brace else None
+    if raw is None:
+        raise ReviewError(f"no json object in remediation reply: {text[:300]!r}")
+    payload = json.loads(raw)
+    findings = payload.get("findings") if isinstance(payload, dict) else None
+    if not isinstance(findings, list):
+        raise ReviewError("remediation reply had no findings array")
+    return [str(f).strip() for f in findings if str(f).strip()]
+
+
+async def _remediate_coverage(
+    pr: PullRequest,
+    verdict: Verdict,
+    missed: list[str],
+    *,
+    cwd: Path | None,
+    diff: str,
+) -> None:
+    """One focused pass over exactly the files the findings skipped.
+
+    Best-effort: a failed pass leaves the findings as they are, and the gate
+    falls through to request_changes.
+    """
+    files = "\n".join(f"- {path}" for path in missed)
+    diff_block = ""
+    if cwd is None and len(diff) <= MAX_DIFF_CHARS:
+        diff_block = f"<diff>\n{diff}\n</diff>\n\n"
+    spec = RunSpec(
+        prompt=_REMEDIATE_PROMPT.format(
+            repo=pr.repo,
+            number=pr.number,
+            where=_remediate_where(cwd),
+            files=files,
+            diff_block=diff_block,
+        ),
+        cwd=str(cwd) if cwd else str(config.ROOT),
+        model=config.REVIEW_MODEL,
+        effort=config.REVIEW_EFFORT,
+        disallowed_tools=("Bash", "Edit", "Write", "NotebookEdit", "WebFetch", "WebSearch"),
+        timeout_seconds=config.REVIEW_TIMEOUT_SECONDS,
+        env_extra={"CCTG_REVIEW": "1"},
+    )
+
+    chunks: list[str] = []
+    cost = 0.0
+    try:
+        async for event in stream_run(spec):
+            if event.kind == "text":
+                chunks.append(event.text)
+            elif event.kind == "result":
+                cost = event.cost_usd
+                if event.is_error:
+                    raise ReviewError(event.text or "the remediation run failed")
+            elif event.kind == "error":
+                raise ReviewError(event.text)
+        added = _parse_findings_reply("".join(chunks))
+    except (ReviewError, json.JSONDecodeError) as exc:
+        log.warning("%s: remediation pass failed; gate falls through: %s", pr.key, exc)
+        return
+
+    verdict.cost_usd += cost
+    if added:
+        log.info("%s: remediation pass examined %d file(s)", pr.key, len(added))
+        verdict.findings.extend(added)
 
 
 def _log_review(pr: PullRequest, verdict: Verdict, *, mode: str) -> None:
@@ -1673,12 +1813,13 @@ async def review_one(
             diff = await _stable_diff(pr)
         except DiffTooLarge:
             verdict = Verdict(
-                verdict="comment",
+                verdict="request_changes",
                 summary=(
                     "This diff is past GitHub's 20,000-line API limit, so the automated "
-                    "pass could not read it. A change this size needs a person — I have "
-                    "not approved it."
+                    "pass could not read it. A change this size needs a person — fix it "
+                    "in person; re-reviewing it will not make it reviewable."
                 ),
+                needs_human=True,
             )
         else:
             if not diff.strip():
@@ -1701,7 +1842,7 @@ async def review_one(
                 # Inline notes are for things that need fixing. Verification
                 # receipts on an approval read as noise on every hunk.
                 verdict.comments = []
-            elif config.REVIEW_CHANGES_LIMIT > 0:
+            elif config.REVIEW_CHANGES_LIMIT > 0 and not verdict.needs_human:
                 # Two rounds of requested changes is the deal. Past it the PR
                 # just bounces between author and reviewer forever, so the
                 # defects go out as an approving comment instead — the body
@@ -1717,7 +1858,6 @@ async def review_one(
                     )
                     verdict.verdict = "approve"
                     verdict.auto_approved = True
-            _coverage_gate(pr, verdict, diff)
 
     if dry_run:
         return Outcome(pr=pr, verdict=verdict, posted=False)
