@@ -317,9 +317,11 @@ REVIEW_LOGIN = _clean(os.getenv("REVIEW_LOGIN"))
 REVIEW_MODE = _clean(os.getenv("REVIEW_MODE")).lower() or "quick"
 REVIEW_MODEL = (
     _clean(os.getenv("REVIEW_MODEL"))
-    or ("" if AGENT_BACKEND == "opencode" else "claude-opus-5")
+    or ("" if AGENT_BACKEND == "opencode" else "claude-opus-5-5")
 )
-REVIEW_EFFORT = _clean(os.getenv("REVIEW_EFFORT")) or "low"
+# Set explicitly: Opus 5.5 defaults to medium when no effort is passed, and a
+# review is exactly the intelligence-sensitive work the higher levels pay for.
+REVIEW_EFFORT = _clean(os.getenv("REVIEW_EFFORT")) or "xhigh"
 # "deep" mode: check the PR head out into a worktree under a local clone of
 # the repo (REVIEW_CLONE_ROOT/<repo-name>) so the reviewer can read real code.
 # Empty disables deep mode - deep reviews then fall back to diff-only.
@@ -337,6 +339,11 @@ REVIEW_TIMEOUT_SECONDS = _int(os.getenv("REVIEW_TIMEOUT_SECONDS"), 600)
 # all of them. 1 restores the old one-at-a-time sweep.
 REVIEW_PARALLEL = _int(os.getenv("REVIEW_PARALLEL"), 3)
 REVIEW_POLL_SECONDS = _int(os.getenv("REVIEW_POLL_SECONDS"), 900)
+# Show the per-sweep "Spent $X" line on Telegram. The figure the agent reports
+# is the API-equivalent token value, not money billed — on a Claude Code (or
+# GLM) subscription nothing is charged per review, so it is misleading there.
+# Off by default; turn on only if you actually pay per token (an API key).
+REVIEW_SHOW_COST = _bool(os.getenv("REVIEW_SHOW_COST"), False)
 # 0 keeps the sweep manual (/reviews); anything else also runs it on the timer.
 REVIEW_WATCH = _bool(os.getenv("REVIEW_WATCH"), False)
 
@@ -356,6 +363,10 @@ REVIEW_COVERAGE_GATE = _bool(os.getenv("REVIEW_COVERAGE_GATE"), True)
 # Before filing request_changes, a second pass re-checks every claimed
 # defect against the code; claims that do not survive are dropped.
 REVIEW_VERIFY = _bool(os.getenv("REVIEW_VERIFY"), True)
+# Before filing an approval, a skeptical second reviewer tries to break it.
+# Defects it finds go through the same verification pass; only survivors
+# flip the approval to request_changes.
+REVIEW_CHALLENGE = _bool(os.getenv("REVIEW_CHALLENGE"), True)
 # Trusted commands run (never by the agent) in the deep-mode worktree and
 # handed to the reviewer as evidence: JSON mapping repo name -> {label: argv}.
 # Example:

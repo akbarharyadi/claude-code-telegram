@@ -19,6 +19,13 @@ import pr_review  # noqa: E402
 from pr_review import PullRequest, ReviewError, Verdict  # noqa: E402
 
 
+@pytest.fixture(autouse=True)
+def _no_challenge_by_default(monkeypatch):
+    """The approval challenge adds a model pass; tests that script an exact
+    sequence of replies opt in explicitly."""
+    monkeypatch.setattr(pr_review.config, "REVIEW_CHALLENGE", False)
+
+
 def test_extracts_a_fenced_verdict():
     verdict = pr_review._extract_verdict(
         'Here you go:\n```json\n{"verdict": "approve", "summary": "Looks fine.", '
@@ -1676,3 +1683,115 @@ def test_summarize_notes_an_auto_approval():
     verdict = Verdict(verdict="approve", summary="ok", auto_approved=True)
     text = pr_review.summarize([pr_review.Outcome(pr=pr, verdict=verdict, posted=True)])
     assert "auto-approved" in text
+
+
+_APPROVE_JSON = (
+    '{"verdict": "approve", "summary": "clean", '
+    '"findings": ["`x.py` — verified the swap"], "comments": []}'
+)
+
+
+def _challenge_on(monkeypatch):
+    monkeypatch.setattr(pr_review.config, "REVIEW_CHALLENGE", True)
+    monkeypatch.setattr(pr_review.config, "REVIEW_CLONE_ROOT", "")
+
+
+@pytest.mark.anyio
+async def test_a_challenged_approval_that_holds_stays_approved(monkeypatch):
+    _challenge_on(monkeypatch)
+    prompts: list[str] = []
+    replies = [_APPROVE_JSON, '{"verdict": "approve", "summary": "nothing found"}']
+
+    async def fake_stream(spec):
+        prompts.append(spec.prompt)
+        yield type("E", (), {"kind": "text", "text": replies.pop(0)})()
+        yield type("E", (), {"kind": "result", "text": "", "cost_usd": 0.01, "is_error": False})()
+
+    monkeypatch.setattr(pr_review, "stream_run", fake_stream)
+    pr = _pr4157()
+
+    verdict = await pr_review.ask_claude(pr, await _tiny_diff(pr))
+
+    assert verdict.verdict == "approve"
+    assert verdict.cost_usd == 0.02
+    assert "second reviewer" in prompts[1]
+    assert "<first-review>" in prompts[1] and "verified the swap" in prompts[1]
+
+
+@pytest.mark.anyio
+async def test_a_verified_challenge_overturns_the_approval(monkeypatch):
+    """A defect the challenger finds AND the verifier confirms flips the
+    approval, leading the findings."""
+    _challenge_on(monkeypatch)
+    monkeypatch.setattr(
+        pr_review, "stream_run",
+        _stream_of([
+            _APPROVE_JSON,
+            '{"verdict": "request_changes", "summary": "caller not updated",'
+            ' "findings": ["`y.py` — still calls the old signature"],'
+            ' "comments": [{"path": "x.py", "line": 1, "body": "breaks y.py"}]}',
+            '```json\n[{"id": 1, "valid": "yes", "evidence": "y.py:9"}]\n```',
+        ]),
+    )
+    pr = _pr4157()
+
+    verdict = await pr_review.ask_claude(pr, await _tiny_diff(pr))
+
+    assert verdict.verdict == "request_changes"
+    assert verdict.findings[0] == "`y.py` — still calls the old signature"
+    assert "adversarial review found 1 defect" in verdict.summary
+    assert [c.path for c in verdict.comments] == ["x.py"]
+    assert verdict.cost_usd == pytest.approx(0.03)  # review + challenge + verify
+
+
+@pytest.mark.anyio
+async def test_a_challenge_rejected_by_the_verifier_keeps_the_approval(monkeypatch):
+    """The challenger can hallucinate too — unverified claims never flip."""
+    _challenge_on(monkeypatch)
+    monkeypatch.setattr(
+        pr_review, "stream_run",
+        _stream_of([
+            _APPROVE_JSON,
+            '{"verdict": "request_changes", "summary": "x",'
+            ' "findings": ["`x.py` — imagined bug"], "comments": []}',
+            '```json\n[{"id": 1, "valid": "no", "evidence": "handled"}]\n```',
+        ]),
+    )
+    pr = _pr4157()
+
+    verdict = await pr_review.ask_claude(pr, await _tiny_diff(pr))
+
+    assert verdict.verdict == "approve"
+    assert verdict.findings == ["`x.py` — verified the swap"]
+
+
+@pytest.mark.anyio
+async def test_a_failed_challenge_leaves_the_approval(monkeypatch):
+    _challenge_on(monkeypatch)
+
+    async def stream(spec):
+        if "second reviewer" in spec.prompt:
+            yield type("E", (), {"kind": "error", "text": "backend exploded"})()
+            return
+        yield type("E", (), {"kind": "text", "text": _APPROVE_JSON})()
+        yield type("E", (), {"kind": "result", "text": "", "cost_usd": 0.01, "is_error": False})()
+
+    monkeypatch.setattr(pr_review, "stream_run", stream)
+    pr = _pr4157()
+
+    verdict = await pr_review.ask_claude(pr, await _tiny_diff(pr))
+
+    assert verdict.verdict == "approve"
+
+
+@pytest.mark.anyio
+async def test_auto_approvals_are_not_challenged(monkeypatch):
+    _challenge_on(monkeypatch)
+    calls: list = []
+    monkeypatch.setattr(pr_review, "stream_run", _approve_stream(calls))
+    verdict = Verdict(verdict="approve", summary="carried defects", auto_approved=True)
+
+    await pr_review._challenge_approval(_pr4157(), verdict, diff="d", cwd=None)
+
+    assert calls == []
+    assert verdict.verdict == "approve"
